@@ -1500,102 +1500,83 @@
       }
     }
 
-    let fcx = minAllX + charBBoxW * 0.5;
-    let fcy = minAllY + charBBoxH * 0.32;
-    let fradX = charBBoxW * 0.16;
-    let fradY = charBBoxH * 0.17;
+    // Precise anatomical face bounding box (Tight fovea around eyes/mouth: ~12-13% character width/height)
+    const fcx = minAllX + charBBoxW * 0.50;
+    const fcy = minAllY + charBBoxH * 0.33;
+    const fradX = charBBoxW * 0.13; // ~55px
+    const fradY = charBBoxH * 0.12; // ~80px
 
-    if (smallLoopCenters.length >= 2) {
-      smallLoopCenters.sort((a, b) => a.x - b.x);
-      fcx = smallLoopCenters[(smallLoopCenters.length / 2) | 0].x;
-      smallLoopCenters.sort((a, b) => a.y - b.y);
-      fcy = smallLoopCenters[(smallLoopCenters.length / 2) | 0].y;
-      fradX = Math.max(charBBoxW * 0.14, Math.abs(smallLoopCenters[smallLoopCenters.length - 1].x - smallLoopCenters[0].x) * 0.7);
-      fradY = Math.max(charBBoxH * 0.14, Math.abs(smallLoopCenters[smallLoopCenters.length - 1].y - smallLoopCenters[0].y) * 0.7);
-    }
-
-    // Statistical Quantiles
+    // Statistical Quantiles for hierarchical stroke weights
     const sortedNormLengths = allLengths.map(l => l / L_char).sort((a, b) => a - b);
-    const p15Len = sortedNormLengths[(sortedNormLengths.length * 0.15) | 0] || 0.005;
-    const p70Len = sortedNormLengths[(sortedNormLengths.length * 0.70) | 0] || 0.025;
-    const p90Len = sortedNormLengths[(sortedNormLengths.length * 0.90) | 0] || 0.075;
+    const p10Len = sortedNormLengths[(sortedNormLengths.length * 0.10) | 0] || 0.003;
+    const p80Len = sortedNormLengths[(sortedNormLengths.length * 0.80) | 0] || 0.040;
 
     const allElements = [];
-    let prunedCount = 0;
 
     for (let i = 0; i < rawElements.length; i++) {
       const el = rawElements[i];
       const pts = el.pts;
+      const sLen = allLengths[i];
+      const normLen = sLen / L_char;
+
+      // Filter sub-pixel dust (< 6.0px)
+      if (sLen < 6.0) continue;
+
       let sumX = 0, sumY = 0;
       for (let p of pts) { sumX += p.x; sumY += p.y; }
       const meanX = sumX / pts.length;
       const meanY = sumY / pts.length;
-      const normLen = allLengths[i] / L_char;
-      const normArea = allAreas[i] / (charBBoxW * charBBoxH + 1e-6);
 
       const distSq = ((meanX - fcx) / fradX) ** 2 + ((meanY - fcy) / fradY) ** 2;
-      const inSaliencyZone = distSq <= 1.0;
+      const inFace = distSq <= 1.0;
 
-      if (inSaliencyZone) {
-        const isAnchorLoop = (el.type === 'loop' && normLen >= 0.015 && normLen <= 0.18);
-        const isAnchorOpen = (el.type === 'open' && normLen >= 0.024);
-        const isApexDot = (normLen <= 0.018 && Math.abs(meanX - fcx) < fradX * 0.35 && Math.abs(meanY - (fcy + fradY * 0.2)) < fradY * 0.35);
-        const isEssentialAnchor = isAnchorLoop || isAnchorOpen || isApexDot;
-
-        if (!isEssentialAnchor) {
-          if (normLen < p15Len * 1.5 || (meanY > fcy && Math.abs(meanX - fcx) > fradX * 0.25)) {
-            prunedCount++;
-            continue; // Pruned parasitic facial clutter
-          }
-        }
-
-        // Delicate facial anchor (w=0.48): 2 iterations of Chaikin corner-cutting into smooth curves/ellipses
-        allElements.push({
-          type: el.type,
-          pts: chaikinSmooth(el.pts, 2, el.type === 'loop'),
-          layer: 'facial_anchor',
-          weight: 0.48
-        });
-        continue;
-      }
-
-      // Outside Saliency Zone
-      if (el.type === 'loop' && (normArea > 0.08 || normLen > p90Len)) {
-        // Silhouette: Rigid structural edges preserved
-        allElements.push({
-          type: el.type,
-          pts: el.pts,
-          layer: 'silhouette',
-          weight: 1.00
-        });
-      } else if (normLen >= p70Len || (el.type === 'loop' && normLen >= p15Len * 3.0)) {
-        // Garments / Hair: 1 iteration gentle curve smoothing
+      if (inFace) {
+        // Within face: preserve all eye/mouth contours! Smooth with 1 iteration to avoid collapsing tiny features
         allElements.push({
           type: el.type,
           pts: chaikinSmooth(el.pts, 1, el.type === 'loop'),
-          layer: 'clothing_hair_major',
-          weight: 0.74
+          layer: 'facial_anchor',
+          weight: 0.48
         });
       } else {
-        // Internal Texture: 2 iterations smoothing to prevent visual friction
-        allElements.push({
-          type: el.type,
-          pts: chaikinSmooth(el.pts, 2, el.type === 'loop'),
-          layer: 'internal_texture',
-          weight: 0.58
-        });
+        // Body, hair, clothes: preserve 100% of all structural and stylistic contours! Zero missing spaces!
+        if (el.type === 'loop' && normLen > p80Len) {
+          // Silhouette: intact geometric edge
+          allElements.push({
+            type: el.type,
+            pts: el.pts,
+            layer: 'silhouette',
+            weight: 1.00
+          });
+        } else if (normLen > p10Len * 2.0) {
+          // Garments / Major Hair: 1 iteration gentle curve smoothing
+          allElements.push({
+            type: el.type,
+            pts: chaikinSmooth(el.pts, 1, el.type === 'loop'),
+            layer: 'clothing_hair_major',
+            weight: 0.74
+          });
+        } else {
+          // Internal Texture: 1 iteration smoothing
+          allElements.push({
+            type: el.type,
+            pts: chaikinSmooth(el.pts, 1, el.type === 'loop'),
+            layer: 'internal_texture',
+            weight: 0.58
+          });
+        }
       }
     }
 
-    // 6. Connected Core Component & MST Eulerian Tree Router (Zero Canvas Exposure)
-    const N_all = allElements.length;
-    if (N_all === 0) return [{ x: 0, y: H - 1, w: 1.0 }, { x: 0, y: H - 1, w: 1.0 }];
+    const N = allElements.length;
+    if (N === 0) return [{ x: 0, y: H - 1, w: 1.0 }, { x: 0, y: H - 1, w: 1.0 }];
 
-    // Sample points per element for fast spatial distance
+    // 6. Complete MST Eulerian Tree Router (100% Connected, ZERO Elements Dropped)
+    // Sample points per element for fast spatial distance calculation
     const elemSamples = [];
-    for (let i = 0; i < N_all; i++) {
+    for (let i = 0; i < N; i++) {
       const pts = allElements[i].pts;
-      const step = Math.max(1, (pts.length / 10) | 0);
+      const step = Math.max(1, (pts.length / 8) | 0);
       const samples = [];
       const sampleIndices = [];
       for (let k = 0; k < pts.length; k += step) {
@@ -1609,14 +1590,14 @@
       elemSamples.push({ samples, sampleIndices });
     }
 
-    // Dense pairwise distances
-    const distMatrix = Array.from({ length: N_all }, () => new Float32Array(N_all).fill(1e6));
+    // Dense pairwise minimum distance between elements
+    const distMatrix = Array.from({ length: N }, () => new Float32Array(N).fill(1e6));
     const bestConnect = new Map();
 
-    for (let i = 0; i < N_all; i++) {
+    for (let i = 0; i < N; i++) {
       const sI = elemSamples[i].samples;
       const idxsI = elemSamples[i].sampleIndices;
-      for (let j = i + 1; j < N_all; j++) {
+      for (let j = i + 1; j < N; j++) {
         const sJ = elemSamples[j].samples;
         const idxsJ = elemSamples[j].sampleIndices;
         let minD = 1e6;
@@ -1640,58 +1621,7 @@
       }
     }
 
-    // Connected Component Analysis with 18.0px threshold
-    const adj18 = Array.from({ length: N_all }, () => []);
-    for (let i = 0; i < N_all; i++) {
-      for (let j = i + 1; j < N_all; j++) {
-        if (distMatrix[i][j] <= 18.0) {
-          adj18[i].push(j);
-          adj18[j].push(i);
-        }
-      }
-    }
-
-    const compLabels = new Int32Array(N_all).fill(-1);
-    let numComp = 0;
-    const compSizes = [];
-
-    for (let i = 0; i < N_all; i++) {
-      if (compLabels[i] !== -1) continue;
-      let cSize = 0;
-      const q = [i];
-      compLabels[i] = numComp;
-      while (q.length > 0) {
-        const u = q.pop();
-        cSize++;
-        for (let v of adj18[u]) {
-          if (compLabels[v] === -1) {
-            compLabels[v] = numComp;
-            q.push(v);
-          }
-        }
-      }
-      compSizes.push(cSize);
-      numComp++;
-    }
-
-    let largestCompId = 0;
-    let maxCSize = -1;
-    for (let c = 0; c < compSizes.length; c++) {
-      if (compSizes[c] > maxCSize) {
-        maxCSize = compSizes[c];
-        largestCompId = c;
-      }
-    }
-
-    // Keep core elements belonging to largest connected component
-    const coreIndices = [];
-    for (let i = 0; i < N_all; i++) {
-      if (compLabels[i] === largestCompId) coreIndices.push(i);
-    }
-    const coreElements = coreIndices.map(idx => allElements[idx]);
-    const N = coreElements.length;
-
-    // Build MST on Core using Prim's algorithm
+    // Build Minimum Spanning Tree over ALL elements using Prim's algorithm
     const inMST = new Uint8Array(N);
     const minEdgeCost = new Float32Array(N).fill(1e6);
     const parentNode = new Int32Array(N).fill(-1);
@@ -1714,11 +1644,9 @@
         mstAdj[u].push(p);
       }
 
-      const origU = coreIndices[u];
       for (let v = 0; v < N; v++) {
         if (!inMST[v]) {
-          const origV = coreIndices[v];
-          const c = distMatrix[origU][origV];
+          const c = distMatrix[u][v];
           if (c < minEdgeCost[v]) {
             minEdgeCost[v] = c;
             parentNode[v] = u;
@@ -1730,7 +1658,7 @@
     // Root selection: bottom-most vertex for clean, single-point vertical entry/exit
     let rootIdx = 0, rEntryIdx = 0, maxY = -1;
     for (let i = 0; i < N; i++) {
-      const pts = coreElements[i].pts;
+      const pts = allElements[i].pts;
       for (let k = 0; k < pts.length; k++) {
         if (pts[k].y > maxY) {
           maxY = pts[k].y;
@@ -1740,20 +1668,20 @@
       }
     }
 
-    const path = [];
-    const rootPts = coreElements[rootIdx].pts;
+    const rawPath = [];
+    const rootPts = allElements[rootIdx].pts;
     const rStart = rootPts[rEntryIdx];
 
     // Single Vertical Entry Line from Bottom Bezel Rail
-    path.push({ x: 0, y: H - 1, w: 1.0 });
-    path.push({ x: Math.round(rStart.x * 10) / 10, y: H - 1, w: 1.0 });
-    path.push({ x: Math.round(rStart.x * 10) / 10, y: Math.round(rStart.y * 10) / 10, w: 1.0 });
+    rawPath.push({ x: 0, y: H - 1, w: 1.0 });
+    rawPath.push({ x: Math.round(rStart.x * 10) / 10, y: H - 1, w: 1.0 });
+    rawPath.push({ x: Math.round(rStart.x * 10) / 10, y: Math.round(rStart.y * 10) / 10, w: 1.0 });
 
     const visitedMST = new Uint8Array(N);
 
     function traverseTree(u, entryIdx) {
       visitedMST[u] = 1;
-      const uEl = coreElements[u];
+      const uEl = allElements[u];
       const uPts = uEl.pts;
       const uWeight = uEl.weight || 1.0;
       const isLoop = (uEl.type === 'loop');
@@ -1763,63 +1691,60 @@
       if (isLoop) {
         for (let off = 1; off <= nPts; off++) {
           const idx = (entryIdx + off) % nPts;
-          path.push({ x: Math.round(uPts[idx].x * 10) / 10, y: Math.round(uPts[idx].y * 10) / 10, w: uWeight });
+          rawPath.push({ x: Math.round(uPts[idx].x * 10) / 10, y: Math.round(uPts[idx].y * 10) / 10, w: uWeight });
         }
         curPosInU = entryIdx;
       } else {
         if (entryIdx > 0) {
           for (let k = entryIdx - 1; k >= 0; k--) {
-            path.push({ x: Math.round(uPts[k].x * 10) / 10, y: Math.round(uPts[k].y * 10) / 10, w: 1.0 });
+            rawPath.push({ x: Math.round(uPts[k].x * 10) / 10, y: Math.round(uPts[k].y * 10) / 10, w: 1.0 });
           }
         }
         for (let k = 1; k < nPts; k++) {
-          path.push({ x: Math.round(uPts[k].x * 10) / 10, y: Math.round(uPts[k].y * 10) / 10, w: uWeight });
+          rawPath.push({ x: Math.round(uPts[k].x * 10) / 10, y: Math.round(uPts[k].y * 10) / 10, w: uWeight });
         }
         curPosInU = nPts - 1;
       }
 
-      // Visit children ordered by position along u to minimize groove retracing
-      const origU = coreIndices[u];
+      // Visit children ordered by branch location along u
       const children = mstAdj[u].filter(v => !visitedMST[v]);
       children.sort((a, b) => {
-        const origA = coreIndices[a], origB = coreIndices[b];
-        const connA = bestConnect.get(`${origU},${origA}`)[0];
-        const connB = bestConnect.get(`${origU},${origB}`)[0];
+        const connA = bestConnect.get(`${u},${a}`)[0];
+        const connB = bestConnect.get(`${u},${b}`)[0];
         return connA - connB;
       });
 
       for (let v of children) {
         if (visitedMST[v]) continue;
-        const origV = coreIndices[v];
-        const [uBranchIdx, vEntryIdx] = bestConnect.get(`${origU},${origV}`);
+        const [uBranchIdx, vEntryIdx] = bestConnect.get(`${u},${v}`);
 
         // 1. Retrace within u to branch point (cost 0.0)
         if (curPosInU !== uBranchIdx) {
           const step = uBranchIdx > curPosInU ? 1 : -1;
           for (let k = curPosInU + step; k !== uBranchIdx + step; k += step) {
-            path.push({ x: Math.round(uPts[k].x * 10) / 10, y: Math.round(uPts[k].y * 10) / 10, w: 1.0 });
+            rawPath.push({ x: Math.round(uPts[k].x * 10) / 10, y: Math.round(uPts[k].y * 10) / 10, w: 1.0 });
           }
           curPosInU = uBranchIdx;
         }
 
-        // 2. Micro-stitch to child v (typically < 10px!)
-        const vPts = coreElements[v].pts;
+        // 2. Micro-stitch to child v
+        const vPts = allElements[v].pts;
         const vPt = vPts[vEntryIdx];
-        path.push({ x: Math.round(vPt.x * 10) / 10, y: Math.round(vPt.y * 10) / 10, w: 1.0 });
+        rawPath.push({ x: Math.round(vPt.x * 10) / 10, y: Math.round(vPt.y * 10) / 10, w: 1.0 });
 
         // 3. Recurse into child v
         const vExitIdx = traverseTree(v, vEntryIdx);
 
-        // 4. Retrace groove inside child v back to vEntryIdx (cost 0.0!)
+        // 4. Retrace groove inside child v back to vEntryIdx
         if (vExitIdx !== vEntryIdx) {
           const step = vEntryIdx > vExitIdx ? 1 : -1;
           for (let k = vExitIdx + step; k !== vEntryIdx + step; k += step) {
-            path.push({ x: Math.round(vPts[k].x * 10) / 10, y: Math.round(vPts[k].y * 10) / 10, w: 1.0 });
+            rawPath.push({ x: Math.round(vPts[k].x * 10) / 10, y: Math.round(vPts[k].y * 10) / 10, w: 1.0 });
           }
         }
 
         // 5. Micro-stitch back from child vEntry to uBranchIdx
-        path.push({ x: Math.round(uPts[uBranchIdx].x * 10) / 10, y: Math.round(uPts[uBranchIdx].y * 10) / 10, w: 1.0 });
+        rawPath.push({ x: Math.round(uPts[uBranchIdx].x * 10) / 10, y: Math.round(uPts[uBranchIdx].y * 10) / 10, w: 1.0 });
         curPosInU = uBranchIdx;
       }
 
@@ -1832,18 +1757,30 @@
     if (finalUPos !== rEntryIdx) {
       const step = rEntryIdx > finalUPos ? 1 : -1;
       for (let k = finalUPos + step; k !== rEntryIdx + step; k += step) {
-        path.push({ x: Math.round(rootPts[k].x * 10) / 10, y: Math.round(rootPts[k].y * 10) / 10, w: 1.0 });
+        rawPath.push({ x: Math.round(rootPts[k].x * 10) / 10, y: Math.round(rootPts[k].y * 10) / 10, w: 1.0 });
       }
     }
 
     // Return down the exact same vertical line to bottom rail origin!
-    path.push({ x: Math.round(rStart.x * 10) / 10, y: H - 1, w: 1.0 });
-    path.push({ x: 0, y: H - 1, w: 1.0 });
+    rawPath.push({ x: Math.round(rStart.x * 10) / 10, y: H - 1, w: 1.0 });
+    rawPath.push({ x: 0, y: H - 1, w: 1.0 });
 
-    // 9. Object-Consistent Weight Retention & Negative Space Jitter Damping
+    // Deduplicate / Sub-pixel filtering
+    const filteredPath = [rawPath[0]];
+    for (let i = 1; i < rawPath.length; i++) {
+      const p = rawPath[i];
+      const prev = filteredPath[filteredPath.length - 1];
+      const dist = Math.hypot(p.x - prev.x, p.y - prev.y);
+      const minD = (p.w !== undefined && p.w < 0.6) ? 0.8 : 0.35;
+      if (dist > minD || Math.abs((p.w || 1.0) - (prev.w || 1.0)) > 0.01) {
+        filteredPath.push(p);
+      }
+    }
+
+    // 7. Object-Consistent Weight Retention & Negative Space Jitter Damping
     const out = [];
-    for (let i = 0; i < path.length; i++) {
-      const p = path[i];
+    for (let i = 0; i < filteredPath.length; i++) {
+      const p = filteredPath[i];
       const isRail = (p.x <= 1 || p.x >= W - 2 || p.y <= 1 || p.y >= H - 2);
       const weight = p.w !== undefined ? p.w : 1.0;
 
