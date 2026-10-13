@@ -1241,8 +1241,27 @@
       if (nonZero === 0) break;
     }
 
-    // 4. Topological Branch Extraction
-    // Neighbor counts on 8-neighborhood
+    // 4. Human Visual Saliency Map (Anatomical Face & Gestalt Silhouette Prior)
+    const saliency = new Float32Array(W * H);
+    const cx = W * 0.5;
+    const cy = H * 0.36;
+    const invRadiusSq = 1.0 / ((W * 0.35) ** 2);
+
+    for (let y = 1; y < H - 1; y++) {
+      const row = y * W;
+      const dy = y - cy;
+      for (let x = 1; x < W - 1; x++) {
+        const dx = x - cx;
+        const fovea = Math.exp(-(dx * dx + dy * dy) * invRadiusSq);
+        // Sobel gradient magnitude
+        const gx = (gray[row + x + 1] - gray[row + x - 1]);
+        const gy = (gray[row + W + x] - gray[row - W + x]);
+        const gMag = Math.hypot(gx, gy);
+        saliency[row + x] = Math.min(1.0, fovea * 0.45 + gMag * 1.8 + darkness[row + x] * 0.25);
+      }
+    }
+
+    // 5. Topological Branch Extraction with Saliency Budget Allocation
     const neighbors = new Uint8Array(W * H);
     for (let y = 1; y < H - 1; y++) {
       const row = y * W;
@@ -1306,20 +1325,33 @@
             pts.push({ x: cx, y: cy });
           }
 
-          if (pts.length >= 3) {
-            // Decimate points slightly to retain curvature without staircasing
+          if (pts.length >= 2) {
+            // Compute average saliency for this stroke
+            let salSum = 0;
+            for (let p of pts) salSum += saliency[p.y * W + p.x];
+            const avgSal = salSum / pts.length;
+
+            // Intelligent Saliency Budgeting:
+            // High saliency (faces/eyes): preserve 100% fine curvature, small L_max
+            // Low saliency (background/dust): decimate coarsely, prune tiny specks
+            if (avgSal < 0.25 && pts.length < 8) {
+              continue; // Prune background noise to save plotter budget
+            }
+
+            const decimateStep = avgSal >= 0.6 ? 1 : (avgSal >= 0.35 ? 2 : 3);
+            const maxSegLen = avgSal >= 0.6 ? 22.0 : (avgSal >= 0.35 ? 36.0 : 52.0);
+
             const simplified = [pts[0]];
-            for (let i = 1; i < pts.length - 1; i += 2) {
+            for (let i = decimateStep; i < pts.length - 1; i += decimateStep) {
               simplified.push(pts[i]);
             }
             simplified.push(pts[pts.length - 1]);
 
-            // [Optimal K-Partitioning] Split long branches into optimal sub-segments (L_max = 32px)
-            const maxSegLen = opt.maxSegmentLen || 32.0;
             let totalLen = 0;
             for (let i = 1; i < simplified.length; i++) {
               totalLen += Math.hypot(simplified[i].x - simplified[i - 1].x, simplified[i].y - simplified[i - 1].y);
             }
+
             if (totalLen > maxSegLen) {
               const k = Math.max(1, Math.ceil(totalLen / maxSegLen));
               const chunkSize = (simplified.length - 1) / k;
