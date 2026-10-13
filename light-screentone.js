@@ -1290,6 +1290,38 @@
       }
     }
 
+    // Chaikin's corner-cutting algorithm: Refines polygonal vertices into smooth, predictable C1 curves/ellipses
+    function chaikinSmooth(pts, iterations, isClosed) {
+      if (!pts || pts.length < 3) return pts;
+      iterations = iterations || 1;
+      let current = pts.map(p => ({ x: p.x, y: p.y }));
+
+      for (let it = 0; it < iterations; it++) {
+        const smoothed = [];
+        const n = current.length;
+        if (isClosed) {
+          for (let i = 0; i < n; i++) {
+            const p0 = current[i];
+            const p1 = current[(i + 1) % n];
+            smoothed.push({ x: 0.75 * p0.x + 0.25 * p1.x, y: 0.75 * p0.y + 0.25 * p1.y });
+            smoothed.push({ x: 0.25 * p0.x + 0.75 * p1.x, y: 0.25 * p0.y + 0.75 * p1.y });
+          }
+          smoothed.push({ x: smoothed[0].x, y: smoothed[0].y }); // keep closed cycle
+        } else {
+          smoothed.push({ x: current[0].x, y: current[0].y }); // preserve start
+          for (let i = 0; i < n - 1; i++) {
+            const p0 = current[i];
+            const p1 = current[i + 1];
+            smoothed.push({ x: 0.75 * p0.x + 0.25 * p1.x, y: 0.75 * p0.y + 0.25 * p1.y });
+            smoothed.push({ x: 0.25 * p0.x + 0.75 * p1.x, y: 0.25 * p0.y + 0.75 * p1.y });
+          }
+          smoothed.push({ x: current[n - 1].x, y: current[n - 1].y }); // preserve end
+        }
+        current = smoothed;
+      }
+      return current;
+    }
+
     // Morphological close (2x2) on binMask to seal 1px micro-gaps before contouring
     const closedMask = new Uint8Array(W * H);
     const dilTemp = new Uint8Array(W * H);
@@ -1517,9 +1549,10 @@
           }
         }
 
+        // Delicate facial anchor (w=0.48): 2 iterations of Chaikin corner-cutting into smooth curves/ellipses
         allElements.push({
           type: el.type,
-          pts: el.pts,
+          pts: chaikinSmooth(el.pts, 2, el.type === 'loop'),
           layer: 'facial_anchor',
           weight: 0.48
         });
@@ -1528,6 +1561,7 @@
 
       // Outside Saliency Zone
       if (el.type === 'loop' && (normArea > 0.08 || normLen > p90Len)) {
+        // Silhouette: Rigid structural edges preserved
         allElements.push({
           type: el.type,
           pts: el.pts,
@@ -1535,16 +1569,18 @@
           weight: 1.00
         });
       } else if (normLen >= p70Len || (el.type === 'loop' && normLen >= p15Len * 3.0)) {
+        // Garments / Hair: 1 iteration gentle curve smoothing
         allElements.push({
           type: el.type,
-          pts: el.pts,
+          pts: chaikinSmooth(el.pts, 1, el.type === 'loop'),
           layer: 'clothing_hair_major',
           weight: 0.74
         });
       } else {
+        // Internal Texture: 2 iterations smoothing to prevent visual friction
         allElements.push({
           type: el.type,
-          pts: el.pts,
+          pts: chaikinSmooth(el.pts, 2, el.type === 'loop'),
           layer: 'internal_texture',
           weight: 0.58
         });
@@ -1569,7 +1605,7 @@
     const cBR = addHwNode(W - 1, H - 1);
     const cBL = addHwNode(0, H - 1);
 
-    const railCost = 0.05;
+    const railCost = 0.001; // Behind bezel plastic: zero visual exposure!
     highwayAdj[cTL].push({ to: cTR, cost: (W - 1) * railCost, pts: [{ x: 0, y: 0 }, { x: W - 1, y: 0 }] });
     highwayAdj[cTR].push({ to: cTL, cost: (W - 1) * railCost, pts: [{ x: W - 1, y: 0 }, { x: 0, y: 0 }] });
     highwayAdj[cTR].push({ to: cBR, cost: (H - 1) * railCost, pts: [{ x: W - 1, y: 0 }, { x: W - 1, y: H - 1 }] });
@@ -1767,15 +1803,41 @@
         unvisited.delete(candIdx);
       }
 
+      const drawnStrokeStack = [];
+
       for (let el of orderedElements) {
         const targetPt = el.pts[0];
         const directDist = Math.hypot(curX - targetPt.x, curY - targetPt.y);
 
-        if (directDist <= 14.0) {
+        // CHEAPER DETOUR STRATEGY (Optimization 2):
+        // 1. Can we backtrack along the stroke we just drew to get closer with ZERO white-paper exposure?
+        let bestBacktrackIdx = -1;
+        let bestBacktrackDist = directDist;
+        if (drawnStrokeStack.length > 0) {
+          const lastDrawn = drawnStrokeStack[drawnStrokeStack.length - 1];
+          const step = Math.max(1, (lastDrawn.length / 10) | 0);
+          for (let k = lastDrawn.length - 1; k >= 0; k -= step) {
+            const bp = lastDrawn[k];
+            const dB2T = Math.hypot(bp.x - targetPt.x, bp.y - targetPt.y);
+            if (dB2T < bestBacktrackDist - 6.0) {
+              bestBacktrackDist = dB2T;
+              bestBacktrackIdx = k;
+            }
+          }
+        }
+
+        if (bestBacktrackIdx !== -1 && bestBacktrackDist < 20.0) {
+          // RETRACE GROOVE: Zero new visual lines on white paper!
+          const lastDrawn = drawnStrokeStack[drawnStrokeStack.length - 1];
+          for (let k = lastDrawn.length - 1; k >= bestBacktrackIdx; k--) {
+            path.push({ x: lastDrawn[k].x, y: lastDrawn[k].y, w: 1.0 });
+          }
+          path.push({ x: targetPt.x, y: targetPt.y, w: 1.0 });
+        } else if (directDist <= 16.0) {
           path.push({ x: targetPt.x, y: targetPt.y, w: 1.0 });
         } else {
-          // Highway Dictionary LUT Query
-          const rampGoal = findNearestRamp(targetPt.x, targetPt.y, 140.0);
+          // Highway Dictionary LUT Query (Detour via submerged rails/existing strokes)
+          const rampGoal = findNearestRamp(targetPt.x, targetPt.y, 240.0);
           let connected = false;
           if (rampGoal !== -1 && curRampIdx !== -1) {
             const hwPath = queryHighway(curRampIdx, rampGoal);
@@ -1789,7 +1851,6 @@
           }
 
           if (!connected) {
-            // Micro-stitch directly to nearest endpoint without vertical lines
             path.push({ x: targetPt.x, y: targetPt.y, w: 1.0 });
           }
         }
@@ -1799,6 +1860,7 @@
         for (let pt of el.pts) {
           path.push({ x: pt.x, y: pt.y, w: elWeight });
         }
+        drawnStrokeStack.push(el.pts);
 
         // Register Drawn Stroke as a Highway Token in Dictionary!
         const uNew = addHwNode(el.pts[0].x, el.pts[0].y);
