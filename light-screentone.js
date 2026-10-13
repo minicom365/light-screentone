@@ -1671,20 +1671,30 @@
     addStealthMove(curX, H - 1);
     path.push({ x: 0, y: H - 1 });
 
-    if (!humanize) return path;
-
-    // 8. Humanized mechanical micro-jitter
+    // 8. Manga Déformer Hierarchical Line Weight & Humanized Jitter
     const out = [];
+    const fcx = W * 0.5;
+    const fcy = H * 0.28;
+    const fradXSq = (W * 0.17) ** 2;
+    const fradYSq = (H * 0.17) ** 2;
+
     for (let i = 0; i < path.length; i++) {
       const p = path[i];
-      if (p.x <= 1 || p.x >= W - 2 || p.y <= 1 || p.y >= H - 2) {
-        out.push(p);
+      const isRail = (p.x <= 1 || p.x >= W - 2 || p.y <= 1 || p.y >= H - 2);
+      const isFace = !isRail && (((p.x - fcx) ** 2 / fradXSq + (p.y - fcy) ** 2 / fradYSq) <= 1.0);
+      const weight = isFace ? 0.52 : 1.0;
+
+      if (!humanize || isRail) {
+        out.push({ x: p.x, y: p.y, w: weight });
       } else {
-        const jx = smoothNoise1D(i * 0.22) * 0.2;
-        const jy = smoothNoise1D(i * 0.22 + 51.3) * 0.2;
+        // Damp jitter in facial zone (0.08 vs 0.22) to preserve delicate negative space
+        const jAmp = isFace ? 0.08 : 0.22;
+        const jx = smoothNoise1D(i * 0.22) * jAmp;
+        const jy = smoothNoise1D(i * 0.22 + 51.3) * jAmp;
         out.push({
           x: Math.round((p.x + jx) * 10) / 10,
-          y: Math.round((p.y + jy) * 10) / 10
+          y: Math.round((p.y + jy) * 10) / 10,
+          w: weight
         });
       }
     }
