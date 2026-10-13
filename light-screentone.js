@@ -1420,9 +1420,93 @@
       }
     }
 
+    // 5.5. Semantic Layer Classification & Aesthetic Facial Clutter Pruning
+    const fcx = W * 0.5;
+    const fcy = H * 0.33; // Normalized head position
+    const fradX = W * 0.16;
+    const fradY = H * 0.17;
+    const totalArea = W * H;
+
+    const rawElements = [];
+    for (let l of closedLoops) rawElements.push({ type: 'loop', pts: l });
+    for (let s of openStrokes) rawElements.push({ type: 'open', pts: s });
+
     const allElements = [];
-    for (let l of closedLoops) allElements.push({ type: 'loop', pts: l });
-    for (let s of openStrokes) allElements.push({ type: 'open', pts: s });
+    let prunedCount = 0;
+
+    for (let i = 0; i < rawElements.length; i++) {
+      const el = rawElements[i];
+      const pts = el.pts;
+      let sumX = 0, sumY = 0;
+      let minX = pts[0].x, maxX = pts[0].x;
+      let minY = pts[0].y, maxY = pts[0].y;
+      let strokeLen = 0;
+
+      for (let j = 0; j < pts.length; j++) {
+        const px = pts[j].x, py = pts[j].y;
+        sumX += px; sumY += py;
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+        if (j > 0) {
+          strokeLen += Math.hypot(px - pts[j - 1].x, py - pts[j - 1].y);
+        }
+      }
+
+      const meanX = sumX / pts.length;
+      const meanY = sumY / pts.length;
+      const distSq = ((meanX - fcx) / fradX) ** 2 + ((meanY - fcy) / fradY) ** 2;
+      const inFaceZone = distSq <= 1.0;
+      const bboxArea = (maxX - minX) * (maxY - minY);
+
+      // Aesthetic Omission: Facial clutter pruning
+      if (inFaceZone) {
+        const isEyeLoop = (el.type === 'loop' && strokeLen >= 18.0 && strokeLen <= 180.0);
+        const isLashOrMouth = (el.type === 'open' && strokeLen >= 24.0);
+        const isNoseDot = (strokeLen <= 16.0 && Math.abs(meanX - fcx) < fradX * 0.35 && Math.abs(meanY - (fcy + 20)) < fradY * 0.35);
+        const isEssentialAnchor = isEyeLoop || isLashOrMouth || isNoseDot;
+
+        if (!isEssentialAnchor) {
+          if (strokeLen < 22.0 || (meanY > fcy - 15 && Math.abs(meanX - fcx) > fradX * 0.25)) {
+            prunedCount++;
+            continue; // Pruned parasitic facial clutter
+          }
+        }
+
+        allElements.push({
+          type: el.type,
+          pts: el.pts,
+          layer: 'facial_anchor',
+          weight: 0.48
+        });
+        continue;
+      }
+
+      // Semantic hierarchy outside face
+      if (el.type === 'loop' && (bboxArea > totalArea * 0.08 || strokeLen > 350.0)) {
+        allElements.push({
+          type: el.type,
+          pts: el.pts,
+          layer: 'silhouette',
+          weight: 1.00
+        });
+      } else if (strokeLen >= 70.0 || (el.type === 'loop' && strokeLen >= 45.0)) {
+        allElements.push({
+          type: el.type,
+          pts: el.pts,
+          layer: 'clothing_hair_major',
+          weight: 0.74
+        });
+      } else {
+        allElements.push({
+          type: el.type,
+          pts: el.pts,
+          layer: 'internal_texture',
+          weight: 0.58
+        });
+      }
+    }
 
     // Tier 1: Early-Exit Physarum Dijkstra (< 0.1ms on graph nodes)
     function physarumGraphDijkstra(sx, sy, gx, gy) {
@@ -1589,14 +1673,14 @@
       const transit = findStealthPath(curX, curY, tx, ty);
       for (let i = 1; i < transit.length; i++) {
         const pt = transit[i];
-        path.push(pt);
+        path.push({ x: pt.x, y: pt.y, w: 1.0 });
         costMap[pt.y * W + pt.x] = 0.005; // Mark highway permanently free
       }
       curX = tx;
       curY = ty;
     }
 
-    // 6. Chain Closed Loops & Open Strokes (Watertight Gestalt Priority)
+    // 7. Chain Closed Loops & Open Strokes (Watertight Gestalt Priority)
     if (allElements.length > 0) {
       const unvisited = new Set(allElements.keys());
       let bestIdx = 0, bestY = -1;
@@ -1655,8 +1739,9 @@
 
       for (let el of orderedElements) {
         addStealthMove(el.pts[0].x, el.pts[0].y);
+        const elWeight = el.weight || 1.0;
         for (let pt of el.pts) {
-          path.push(pt);
+          path.push({ x: pt.x, y: pt.y, w: elWeight });
           const px = Math.round(pt.x), py = Math.round(pt.y);
           if (px >= 0 && px < W && py >= 0 && py < H) {
             costMap[py * W + px] = 0.005; // Scratched groove becomes free highway
@@ -1667,28 +1752,22 @@
       }
     }
 
-    // 7. Clean Return to Bottom Rail Origin (Pen Lifts: 0)
+    // 8. Clean Return to Bottom Rail Origin (Pen Lifts: 0)
     addStealthMove(curX, H - 1);
-    path.push({ x: 0, y: H - 1 });
+    path.push({ x: 0, y: H - 1, w: 1.0 });
 
-    // 8. Manga Déformer Hierarchical Line Weight & Humanized Jitter
+    // 9. Object-Consistent Weight Retention & Negative Space Jitter Damping
     const out = [];
-    const fcx = W * 0.5;
-    const fcy = H * 0.28;
-    const fradXSq = (W * 0.17) ** 2;
-    const fradYSq = (H * 0.17) ** 2;
-
     for (let i = 0; i < path.length; i++) {
       const p = path[i];
       const isRail = (p.x <= 1 || p.x >= W - 2 || p.y <= 1 || p.y >= H - 2);
-      const isFace = !isRail && (((p.x - fcx) ** 2 / fradXSq + (p.y - fcy) ** 2 / fradYSq) <= 1.0);
-      const weight = isFace ? 0.52 : 1.0;
+      const weight = p.w !== undefined ? p.w : 1.0;
 
       if (!humanize || isRail) {
         out.push({ x: p.x, y: p.y, w: weight });
       } else {
-        // Damp jitter in facial zone (0.08 vs 0.22) to preserve delicate negative space
-        const jAmp = isFace ? 0.08 : 0.22;
+        // Damp jitter for delicate lines (w < 0.6) to preserve pristine negative space
+        const jAmp = weight < 0.6 ? 0.08 : (weight < 0.8 ? 0.15 : 0.22);
         const jx = smoothNoise1D(i * 0.22) * jAmp;
         const jy = smoothNoise1D(i * 0.22 + 51.3) * jAmp;
         out.push({
