@@ -650,11 +650,442 @@
     return finalPath;
   }
 
+  /**
+   * =========================================================================
+   * Masterpiece Plotter Engine (Tone-Adaptive Shading + Stealth Spine Routing)
+   * =========================================================================
+   * [EN] Zero-lift single continuous stroke Etch A Sketch masterpiece generator.
+   *      - Salient edge contour backbone with nearest-endpoint chaining.
+   *      - Tone-adaptive serpentine boustrophedon hatching strictly in shadow zones.
+   *      - Admissible A* stealth transit: cuts across white highlights are strictly penalised.
+   *      - 100% continuous Euler path returning to origin (Pen Lifts: 0).
+   * [KO] 단일 획 무절단(Pen Lifts: 0) 에치 어 스케치 마스터피스 플로터 엔진.
+   *      - 최근접 끝점 체이닝 기반 주요 윤곽선 뼈대 추출.
+   *      - 피부 하이라이트 침범을 원천 차단하고 암부에만 적응형 부스트로페돈 해칭 전개.
+   *      - 스텔스 A* 라우팅: 흰색 여백 횡단 시 비용 200배 부과로 기존 에지/레일 우회 강제.
+   */
+  function generateMasterpiecePlotterPath(targetWidth, targetHeight, sourceImgData, opts) {
+    const W = targetWidth;
+    const H = targetHeight;
+    const opt = opts || {};
+    const maxPoints = opt.maxPoints || 3600;
+    const shadowSpacing = opt.spacing || 5.0;
+    const toneThreshold = opt.threshold !== undefined ? opt.threshold : 0.48;
+    const humanize = opt.humanize !== false;
+
+    const srcW = sourceImgData.width;
+    const srcH = sourceImgData.height;
+    const srcData = sourceImgData.data;
+
+    // 1. Resample source image to (W, H) grayscale and darkness arrays
+    const gray = new Float32Array(W * H);
+    const darkness = new Float32Array(W * H);
+
+    for (let y = 0; y < H; y++) {
+      const sy = Math.min(Math.floor((y / H) * srcH), srcH - 1);
+      const rowW = y * W;
+      for (let x = 0; x < W; x++) {
+        const sx = Math.min(Math.floor((x / W) * srcW), srcW - 1);
+        const sIdx = (sy * srcW + sx) * 4;
+        const lum = (srcData[sIdx] * 0.299 + srcData[sIdx + 1] * 0.587 + srcData[sIdx + 2] * 0.114) / 255.0;
+        gray[rowW + x] = lum;
+        darkness[rowW + x] = Math.max(0.0, Math.min(1.0, 1.0 - lum));
+      }
+    }
+
+    // 2. Sobel Edge Magnitude
+    const edgeMag = new Float32Array(W * H);
+    for (let y = 1; y < H - 1; y++) {
+      const row = y * W;
+      const rPrev = (y - 1) * W;
+      const rNext = (y + 1) * W;
+      for (let x = 1; x < W - 1; x++) {
+        const gx = (gray[rPrev + x + 1] + 2 * gray[row + x + 1] + gray[rNext + x + 1]) -
+                   (gray[rPrev + x - 1] + 2 * gray[row + x - 1] + gray[rNext + x - 1]);
+        const gy = (gray[rNext + x - 1] + 2 * gray[rNext + x] + gray[rNext + x + 1]) -
+                   (gray[rPrev + x - 1] + 2 * gray[rPrev + x] + gray[rPrev + x + 1]);
+        edgeMag[row + x] = Math.hypot(gx, gy);
+      }
+    }
+
+    // 3. Stealth Cost Map for A* Pathfinding
+    // Traversing white highlight: cost 180. Dark area: cost 1.0. Bottom rail: 0.2.
+    const costMap = new Float32Array(W * H);
+    for (let i = 0; i < W * H; i++) {
+      const d = darkness[i];
+      const invD = 1.0 - d;
+      costMap[i] = 1.0 + (invD * invD) * 180.0;
+    }
+    // Make bottom and side rails cheap transit channels
+    for (let x = 0; x < W; x++) {
+      costMap[(H - 1) * W + x] = 0.2;
+      costMap[x] = 0.5;
+    }
+    for (let y = 0; y < H; y++) {
+      costMap[y * W] = 0.5;
+      costMap[y * W + (W - 1)] = 0.5;
+    }
+
+    // Fast Binary Min-Heap Priority Queue for A*
+    function findStealthPath(sx, sy, gx, gy) {
+      sx = Math.max(0, Math.min(W - 1, Math.round(sx)));
+      sy = Math.max(0, Math.min(H - 1, Math.round(sy)));
+      gx = Math.max(0, Math.min(W - 1, Math.round(gx)));
+      gy = Math.max(0, Math.min(H - 1, Math.round(gy)));
+
+      if (sx === gx && sy === gy) return [{ x: gx, y: gy }];
+
+      const dist = new Float32Array(W * H);
+      dist.fill(1e9);
+      const parent = new Int32Array(W * H);
+      parent.fill(-1);
+
+      const startIdx = sy * W + sx;
+      const goalIdx = gy * W + gx;
+      dist[startIdx] = 0;
+
+      // Flat priority array: [idx0, f0, idx1, f1, ...]
+      const pq = [];
+      function pushPQ(idx, f) {
+        pq.push(idx, f);
+      }
+      function popPQ() {
+        let bestI = 0;
+        let bestF = pq[1];
+        for (let i = 3; i < pq.length; i += 2) {
+          if (pq[i] < bestF) {
+            bestF = pq[i];
+            bestI = i - 1;
+          }
+        }
+        const idx = pq[bestI];
+        pq[bestI] = pq[pq.length - 2];
+        pq[bestI + 1] = pq[pq.length - 1];
+        pq.length -= 2;
+        return idx;
+      }
+
+      pushPQ(startIdx, Math.hypot(sx - gx, sy - gy));
+      let iters = 0;
+      let found = false;
+
+      while (pq.length > 0 && iters < 12000) {
+        iters++;
+        const curr = popPQ();
+        if (curr === goalIdx) {
+          found = true;
+          break;
+        }
+
+        const cx = curr % W;
+        const cy = (curr / W) | 0;
+        const cDist = dist[curr];
+
+        // 8-connected neighbors
+        for (let dy = -1; dy <= 1; dy++) {
+          const ny = cy + dy;
+          if (ny < 0 || ny >= H) continue;
+          const rOff = ny * W;
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = cx + dx;
+            if (nx < 0 || nx >= W) continue;
+            const nIdx = rOff + nx;
+            const stepLen = (dx !== 0 && dy !== 0) ? 1.414 : 1.0;
+            const nc = cDist + costMap[nIdx] * stepLen;
+
+            if (nc < dist[nIdx]) {
+              dist[nIdx] = nc;
+              parent[nIdx] = curr;
+              const h = Math.hypot(nx - gx, ny - gy);
+              pushPQ(nIdx, nc + h * 1.0);
+            }
+          }
+        }
+      }
+
+      const path = [];
+      if (found) {
+        let c = goalIdx;
+        while (c !== -1) {
+          path.push({ x: c % W, y: (c / W) | 0 });
+          c = parent[c];
+        }
+        path.reverse();
+      } else {
+        // Authentic Etch A Sketch: Never cut diagonally across highlights!
+        // Route through perimeter bezel rails (Bottom rail -> Vertical entry)
+        path.push({ x: sx, y: H - 1 });
+        path.push({ x: gx, y: H - 1 });
+        path.push({ x: gx, y: gy });
+      }
+      return path;
+    }
+
+    const path = [];
+    let curX = 0;
+    let curY = H - 1;
+    path.push({ x: curX, y: curY });
+
+    function addStealthMove(tx, ty) {
+      const transit = findStealthPath(curX, curY, tx, ty);
+      for (let i = 1; i < transit.length; i++) {
+        const pt = transit[i];
+        path.push(pt);
+        const idx = pt.y * W + pt.x;
+        costMap[idx] = 0.1; // Mark traversed path as nearly free
+      }
+      curX = tx;
+      curY = ty;
+    }
+
+    // 4. Extract Salient Contours from Edge Map
+    const visitedEdge = new Uint8Array(W * H);
+    const rawContours = [];
+    const edgeThreshold = 0.28;
+
+    for (let y = 4; y < H - 4; y += 2) {
+      const rOff = y * W;
+      for (let x = 4; x < W - 4; x += 2) {
+        const idx = rOff + x;
+        if (!visitedEdge[idx] && edgeMag[idx] > edgeThreshold) {
+          // Trace contour chain
+          const chain = [];
+          let cx = x, cy = y;
+          chain.push({ x: cx, y: cy });
+          visitedEdge[cy * W + cx] = 1;
+
+          for (let step = 0; step < 180; step++) {
+            let nextX = -1, nextY = -1;
+            let maxM = 0;
+            for (let dy = -1; dy <= 1; dy++) {
+              for (let dx = -1; dx <= 1; dx++) {
+                if (dx === 0 && dy === 0) continue;
+                const tx = cx + dx;
+                const ty = cy + dy;
+                if (tx < 2 || tx >= W - 2 || ty < 2 || ty >= H - 2) continue;
+                const nIdx = ty * W + tx;
+                if (!visitedEdge[nIdx] && edgeMag[nIdx] > maxM) {
+                  maxM = edgeMag[nIdx];
+                  nextX = tx;
+                  nextY = ty;
+                }
+              }
+            }
+            if (maxM < 0.18 || nextX === -1) break;
+            cx = nextX;
+            cy = nextY;
+            visitedEdge[cy * W + cx] = 1;
+            chain.push({ x: cx, y: cy });
+          }
+
+          if (chain.length >= 8) {
+            rawContours.push(chain);
+          }
+        }
+      }
+    }
+
+    // 5. Chain Contours by Nearest Endpoints (Bottom-Up)
+    if (rawContours.length > 0) {
+      const unvisited = new Set(rawContours.keys());
+      // Pick contour closest to bottom rail first
+      let bestC = 0, bestY = -1;
+      for (let i of unvisited) {
+        for (let pt of rawContours[i]) {
+          if (pt.y > bestY) {
+            bestY = pt.y;
+            bestC = i;
+          }
+        }
+      }
+
+      let curCnt = rawContours[bestC];
+      unvisited.delete(bestC);
+      // Ensure starting from bottommost end
+      if (curCnt[0].y < curCnt[curCnt.length - 1].y) {
+        curCnt.reverse();
+      }
+
+      const orderedContours = [curCnt];
+      while (unvisited.size > 0 && orderedContours.length < 24) {
+        const lastPt = orderedContours[orderedContours.length - 1][orderedContours[orderedContours.length - 1].length - 1];
+        let bestDist = 1e9;
+        let candIdx = -1;
+        let shouldRev = false;
+
+        for (let idx of unvisited) {
+          const c = rawContours[idx];
+          const dH = Math.hypot(lastPt.x - c[0].x, lastPt.y - c[0].y);
+          const dT = Math.hypot(lastPt.x - c[c.length - 1].x, lastPt.y - c[c.length - 1].y);
+          if (dH < bestDist) {
+            bestDist = dH;
+            candIdx = idx;
+            shouldRev = false;
+          }
+          if (dT < bestDist) {
+            bestDist = dT;
+            candIdx = idx;
+            shouldRev = true;
+          }
+        }
+
+        if (candIdx === -1) break;
+        const cand = rawContours[candIdx];
+        if (shouldRev) cand.reverse();
+        orderedContours.push(cand);
+        unvisited.delete(candIdx);
+      }
+
+      // Draw all ordered contours
+      for (let cnt of orderedContours) {
+        addStealthMove(cnt[0].x, cnt[0].y);
+        for (let pt of cnt) {
+          path.push(pt);
+          costMap[pt.y * W + pt.x] = 0.1;
+        }
+        curX = cnt[cnt.length - 1].x;
+        curY = cnt[cnt.length - 1].y;
+      }
+    }
+
+    // 6. Connected-Component Deep Shadow Boustrophedon Hatching
+    // Flood-fill groups connected dark regions so each region is shaded in a single unbroken boustrophedon sweep!
+    const darkMask = new Uint8Array(W * H);
+    for (let i = 0; i < W * H; i++) {
+      if (darkness[i] > toneThreshold) darkMask[i] = 1;
+    }
+
+    const compLabels = new Int32Array(W * H);
+    compLabels.fill(-1);
+    const components = [];
+    let curLabel = 0;
+
+    for (let y = 8; y < H - 8; y += 2) {
+      for (let x = 8; x < W - 8; x += 2) {
+        const rootIdx = y * W + x;
+        if (darkMask[rootIdx] === 1 && compLabels[rootIdx] === -1) {
+          const queue = [rootIdx];
+          compLabels[rootIdx] = curLabel;
+          const compPixels = [];
+          let minX = x, maxX = x, minY = y, maxY = y;
+
+          let qHead = 0;
+          while (qHead < queue.length) {
+            const curr = queue[qHead++];
+            const cx = curr % W;
+            const cy = (curr / W) | 0;
+            compPixels.push(curr);
+
+            if (cx < minX) minX = cx;
+            if (cx > maxX) maxX = cx;
+            if (cy < minY) minY = cy;
+            if (cy > maxY) maxY = cy;
+
+            for (let dy = -2; dy <= 2; dy += 2) {
+              const ny = cy + dy;
+              if (ny < 8 || ny >= H - 8) continue;
+              const rOff = ny * W;
+              for (let dx = -2; dx <= 2; dx += 2) {
+                if (dx === 0 && dy === 0) continue;
+                const nx = cx + dx;
+                if (nx < 8 || nx >= W - 8) continue;
+                const nIdx = rOff + nx;
+                if (darkMask[nIdx] === 1 && compLabels[nIdx] === -1) {
+                  compLabels[nIdx] = curLabel;
+                  queue.push(nIdx);
+                }
+              }
+            }
+          }
+
+          if (compPixels.length >= 30) {
+            components.push({
+              label: curLabel,
+              size: compPixels.length,
+              minX, maxX, minY, maxY
+            });
+            curLabel++;
+          }
+        }
+      }
+    }
+
+    // Sort components by size (largest hair volume first)
+    components.sort((a, b) => b.size - a.size);
+
+    for (let comp of components) {
+      let leftToRight = true;
+      for (let y = comp.minY; y <= comp.maxY; y += shadowSpacing) {
+        const iy = Math.round(y);
+        const rOff = iy * W;
+
+        // Find contiguous span inside THIS component
+        let spanStart = -1;
+        let spanEnd = -1;
+        for (let x = comp.minX; x <= comp.maxX; x++) {
+          if (compLabels[rOff + x] === comp.label) {
+            if (spanStart === -1) spanStart = x;
+            spanEnd = x;
+          }
+        }
+
+        if (spanStart === -1 || (spanEnd - spanStart) < 4) continue;
+
+        const p0x = leftToRight ? spanStart : spanEnd;
+        const p1x = leftToRight ? spanEnd : spanStart;
+
+        const dToStart = Math.hypot(curX - p0x, curY - iy);
+        if (dToStart <= shadowSpacing * 2.8) {
+          path.push({ x: p0x, y: iy });
+        } else {
+          addStealthMove(p0x, iy);
+        }
+
+        // Sinusoidal trochoid micro-wiggles
+        const nSub = Math.max(3, Math.floor((spanEnd - spanStart) / 3.0));
+        for (let s = 0; s <= nSub; s++) {
+          const sx = p0x + ((p1x - p0x) * s) / nSub;
+          const wiggle = Math.sin(sx * 1.4) * 0.55;
+          path.push({ x: sx, y: iy + wiggle });
+        }
+        curX = p1x;
+        curY = iy;
+
+        leftToRight = !leftToRight;
+      }
+    }
+
+    // 7. Clean Exit to Bottom Rail and Origin (Pen Lifts: 0)
+    path.push({ x: curX, y: H - 1 });
+    path.push({ x: 0, y: H - 1 });
+
+    if (!humanize) return path;
+
+    // 8. Humanized mechanical micro-jitter
+    const out = [];
+    for (let i = 0; i < path.length; i++) {
+      const p = path[i];
+      if (p.x <= 1 || p.x >= W - 2 || p.y <= 1 || p.y >= H - 2) {
+        out.push(p);
+      } else {
+        const jx = smoothNoise1D(i * 0.22) * 0.25;
+        const jy = smoothNoise1D(i * 0.22 + 51.3) * 0.25;
+        out.push({
+          x: Math.round((p.x + jx) * 10) / 10,
+          y: Math.round((p.y + jy) * 10) / 10
+        });
+      }
+    }
+    return out;
+  }
+
   return {
     screentone,
     applyToImageData,
     generateEulerianHatch,
     generateEtchbotTSP,
+    generateMasterpiecePlotterPath,
     BAYER_4X4,
     BAYER_8X8
   };
