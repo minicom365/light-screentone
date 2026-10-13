@@ -1420,16 +1420,73 @@
       }
     }
 
-    // 5.5. Semantic Layer Classification & Aesthetic Facial Clutter Pruning
-    const fcx = W * 0.5;
-    const fcy = H * 0.33; // Normalized head position
-    const fradX = W * 0.16;
-    const fradY = H * 0.17;
-    const totalArea = W * H;
-
+    // 5.5. Self-Adaptive Scale & Position Invariant Semantic Decomposition
+    // No fixed (0.5W, 0.33H) location! No fixed pixel lengths!
     const rawElements = [];
     for (let l of closedLoops) rawElements.push({ type: 'loop', pts: l });
     for (let s of openStrokes) rawElements.push({ type: 'open', pts: s });
+
+    const allLengths = [];
+    const allAreas = [];
+    let minAllX = 1e9, maxAllX = -1e9, minAllY = 1e9, maxAllY = -1e9;
+
+    for (let i = 0; i < rawElements.length; i++) {
+      const pts = rawElements[i].pts;
+      let sLen = 0;
+      let minX = pts[0].x, maxX = pts[0].x, minY = pts[0].y, maxY = pts[0].y;
+      for (let j = 0; j < pts.length; j++) {
+        const px = pts[j].x, py = pts[j].y;
+        if (px < minAllX) minAllX = px;
+        if (px > maxAllX) maxAllX = px;
+        if (py < minAllY) minAllY = py;
+        if (py > maxAllY) maxAllY = py;
+        if (px < minX) minX = px;
+        if (px > maxX) maxX = px;
+        if (py < minY) minY = py;
+        if (py > maxY) maxY = py;
+        if (j > 0) sLen += Math.hypot(px - pts[j - 1].x, py - pts[j - 1].y);
+      }
+      allLengths.push(sLen);
+      allAreas.push((maxX - minX) * (maxY - minY));
+    }
+
+    const charBBoxW = Math.max(1.0, maxAllX - minAllX);
+    const charBBoxH = Math.max(1.0, maxAllY - minAllY);
+    const L_char = Math.hypot(charBBoxW, charBBoxH);
+
+    // Self-Adaptive Saliency Center (Median of dense feature loops)
+    const smallLoopCenters = [];
+    for (let i = 0; i < rawElements.length; i++) {
+      if (rawElements[i].type === 'loop') {
+        const normL = allLengths[i] / L_char;
+        if (normL >= 0.02 && normL <= 0.20) {
+          let sx = 0, sy = 0;
+          const pts = rawElements[i].pts;
+          for (let p of pts) { sx += p.x; sy += p.y; }
+          smallLoopCenters.push({ x: sx / pts.length, y: sy / pts.length });
+        }
+      }
+    }
+
+    let fcx = minAllX + charBBoxW * 0.5;
+    let fcy = minAllY + charBBoxH * 0.32;
+    let fradX = charBBoxW * 0.16;
+    let fradY = charBBoxH * 0.17;
+
+    if (smallLoopCenters.length >= 2) {
+      smallLoopCenters.sort((a, b) => a.x - b.x);
+      fcx = smallLoopCenters[(smallLoopCenters.length / 2) | 0].x;
+      smallLoopCenters.sort((a, b) => a.y - b.y);
+      fcy = smallLoopCenters[(smallLoopCenters.length / 2) | 0].y;
+      fradX = Math.max(charBBoxW * 0.14, Math.abs(smallLoopCenters[smallLoopCenters.length - 1].x - smallLoopCenters[0].x) * 0.7);
+      fradY = Math.max(charBBoxH * 0.14, Math.abs(smallLoopCenters[smallLoopCenters.length - 1].y - smallLoopCenters[0].y) * 0.7);
+    }
+
+    // Statistical Quantiles
+    const sortedNormLengths = allLengths.map(l => l / L_char).sort((a, b) => a - b);
+    const p15Len = sortedNormLengths[(sortedNormLengths.length * 0.15) | 0] || 0.005;
+    const p70Len = sortedNormLengths[(sortedNormLengths.length * 0.70) | 0] || 0.025;
+    const p90Len = sortedNormLengths[(sortedNormLengths.length * 0.90) | 0] || 0.075;
 
     const allElements = [];
     let prunedCount = 0;
@@ -1438,37 +1495,23 @@
       const el = rawElements[i];
       const pts = el.pts;
       let sumX = 0, sumY = 0;
-      let minX = pts[0].x, maxX = pts[0].x;
-      let minY = pts[0].y, maxY = pts[0].y;
-      let strokeLen = 0;
-
-      for (let j = 0; j < pts.length; j++) {
-        const px = pts[j].x, py = pts[j].y;
-        sumX += px; sumY += py;
-        if (px < minX) minX = px;
-        if (px > maxX) maxX = px;
-        if (py < minY) minY = py;
-        if (py > maxY) maxY = py;
-        if (j > 0) {
-          strokeLen += Math.hypot(px - pts[j - 1].x, py - pts[j - 1].y);
-        }
-      }
-
+      for (let p of pts) { sumX += p.x; sumY += p.y; }
       const meanX = sumX / pts.length;
       const meanY = sumY / pts.length;
-      const distSq = ((meanX - fcx) / fradX) ** 2 + ((meanY - fcy) / fradY) ** 2;
-      const inFaceZone = distSq <= 1.0;
-      const bboxArea = (maxX - minX) * (maxY - minY);
+      const normLen = allLengths[i] / L_char;
+      const normArea = allAreas[i] / (charBBoxW * charBBoxH + 1e-6);
 
-      // Aesthetic Omission: Facial clutter pruning
-      if (inFaceZone) {
-        const isEyeLoop = (el.type === 'loop' && strokeLen >= 18.0 && strokeLen <= 180.0);
-        const isLashOrMouth = (el.type === 'open' && strokeLen >= 24.0);
-        const isNoseDot = (strokeLen <= 16.0 && Math.abs(meanX - fcx) < fradX * 0.35 && Math.abs(meanY - (fcy + 20)) < fradY * 0.35);
-        const isEssentialAnchor = isEyeLoop || isLashOrMouth || isNoseDot;
+      const distSq = ((meanX - fcx) / fradX) ** 2 + ((meanY - fcy) / fradY) ** 2;
+      const inSaliencyZone = distSq <= 1.0;
+
+      if (inSaliencyZone) {
+        const isAnchorLoop = (el.type === 'loop' && normLen >= 0.015 && normLen <= 0.18);
+        const isAnchorOpen = (el.type === 'open' && normLen >= 0.024);
+        const isApexDot = (normLen <= 0.018 && Math.abs(meanX - fcx) < fradX * 0.35 && Math.abs(meanY - (fcy + fradY * 0.2)) < fradY * 0.35);
+        const isEssentialAnchor = isAnchorLoop || isAnchorOpen || isApexDot;
 
         if (!isEssentialAnchor) {
-          if (strokeLen < 22.0 || (meanY > fcy - 15 && Math.abs(meanX - fcx) > fradX * 0.25)) {
+          if (normLen < p15Len * 1.5 || (meanY > fcy && Math.abs(meanX - fcx) > fradX * 0.25)) {
             prunedCount++;
             continue; // Pruned parasitic facial clutter
           }
@@ -1483,15 +1526,15 @@
         continue;
       }
 
-      // Semantic hierarchy outside face
-      if (el.type === 'loop' && (bboxArea > totalArea * 0.08 || strokeLen > 350.0)) {
+      // Outside Saliency Zone
+      if (el.type === 'loop' && (normArea > 0.08 || normLen > p90Len)) {
         allElements.push({
           type: el.type,
           pts: el.pts,
           layer: 'silhouette',
           weight: 1.00
         });
-      } else if (strokeLen >= 70.0 || (el.type === 'loop' && strokeLen >= 45.0)) {
+      } else if (normLen >= p70Len || (el.type === 'loop' && normLen >= p15Len * 3.0)) {
         allElements.push({
           type: el.type,
           pts: el.pts,
@@ -1508,33 +1551,122 @@
       }
     }
 
-    // Tier 1: Early-Exit Physarum Dijkstra (< 0.1ms on graph nodes)
-    function physarumGraphDijkstra(sx, sy, gx, gy) {
-      if (topoNodes.length === 0) return null;
+    // 6. Dictionary-Based Highway LUT Routing (Sub-10ms Acceleration)
+    // Replaces 786k-node Grid A* with Compressed Highway Tokens (TraceIt Path Reuse)
+    const highwayNodes = [];
+    const highwayAdj = [];
 
-      let uStart = -1, minDS = 1e9;
-      let vGoal = -1, minDG = 1e9;
-      for (let i = 0; i < topoNodes.length; i++) {
-        const ds = (topoNodes[i].x - sx) ** 2 + (topoNodes[i].y - sy) ** 2;
-        const dg = (topoNodes[i].x - gx) ** 2 + (topoNodes[i].y - gy) ** 2;
-        if (ds < minDS) { minDS = ds; uStart = i; }
-        if (dg < minDG) { minDG = dg; vGoal = i; }
+    function addHwNode(x, y) {
+      const idx = highwayNodes.length;
+      highwayNodes.push({ x: +x, y: +y });
+      highwayAdj.push([]);
+      return idx;
+    }
+
+    // Base alphabet: 4 Corners and Perimeter Rails
+    const cTL = addHwNode(0, 0);
+    const cTR = addHwNode(W - 1, 0);
+    const cBR = addHwNode(W - 1, H - 1);
+    const cBL = addHwNode(0, H - 1);
+
+    const railCost = 0.05;
+    highwayAdj[cTL].push({ to: cTR, cost: (W - 1) * railCost, pts: [{ x: 0, y: 0 }, { x: W - 1, y: 0 }] });
+    highwayAdj[cTR].push({ to: cTL, cost: (W - 1) * railCost, pts: [{ x: W - 1, y: 0 }, { x: 0, y: 0 }] });
+    highwayAdj[cTR].push({ to: cBR, cost: (H - 1) * railCost, pts: [{ x: W - 1, y: 0 }, { x: W - 1, y: H - 1 }] });
+    highwayAdj[cBR].push({ to: cTR, cost: (H - 1) * railCost, pts: [{ x: W - 1, y: H - 1 }, { x: W - 1, y: 0 }] });
+    highwayAdj[cBR].push({ to: cBL, cost: (W - 1) * railCost, pts: [{ x: W - 1, y: H - 1 }, { x: 0, y: H - 1 }] });
+    highwayAdj[cBL].push({ to: cBR, cost: (W - 1) * railCost, pts: [{ x: 0, y: H - 1 }, { x: W - 1, y: H - 1 }] });
+    highwayAdj[cBL].push({ to: cTL, cost: (H - 1) * railCost, pts: [{ x: 0, y: H - 1 }, { x: 0, y: 0 }] });
+    highwayAdj[cTL].push({ to: cBL, cost: (H - 1) * railCost, pts: [{ x: 0, y: 0 }, { x: 0, y: H - 1 }] });
+
+    // Spatial hash grid for O(1) ramp lookup
+    const gridSize = 32;
+    const gw = Math.ceil(W / gridSize);
+    const gh = Math.ceil(H / gridSize);
+    const spatialBuckets = Array.from({ length: gw * gh }, () => []);
+
+    function registerHwNode(nIdx) {
+      const node = highwayNodes[nIdx];
+      const bx = Math.max(0, Math.min(gw - 1, (node.x / gridSize) | 0));
+      const by = Math.max(0, Math.min(gh - 1, (node.y / gridSize) | 0));
+      spatialBuckets[by * gw + bx].push(nIdx);
+    }
+
+    for (let i = 0; i < 4; i++) registerHwNode(i);
+
+    function autoLinkNearby(nIdx, maxLinkDist) {
+      maxLinkDist = maxLinkDist || 38.0;
+      const node = highwayNodes[nIdx];
+      const bx = Math.max(0, Math.min(gw - 1, (node.x / gridSize) | 0));
+      const by = Math.max(0, Math.min(gh - 1, (node.y / gridSize) | 0));
+      const radCells = Math.ceil(maxLinkDist / gridSize);
+      const dSqMax = maxLinkDist * maxLinkDist;
+
+      for (let dy = -radCells; dy <= radCells; dy++) {
+        const cy = by + dy;
+        if (cy < 0 || cy >= gh) continue;
+        const rOff = cy * gw;
+        for (let dx = -radCells; dx <= radCells; dx++) {
+          const cx = bx + dx;
+          if (cx < 0 || cx >= gw) continue;
+          const bucket = spatialBuckets[rOff + cx];
+          for (let k = 0; k < bucket.length; k++) {
+            const oIdx = bucket[k];
+            if (oIdx === nIdx) continue;
+            const on = highwayNodes[oIdx];
+            const dSq = (on.x - node.x) ** 2 + (on.y - node.y) ** 2;
+            if (dSq <= dSqMax) {
+              const dist = Math.sqrt(dSq);
+              highwayAdj[nIdx].push({ to: oIdx, cost: dist * 0.01, pts: [{ x: node.x, y: node.y }, { x: on.x, y: on.y }] });
+              highwayAdj[oIdx].push({ to: nIdx, cost: dist * 0.01, pts: [{ x: on.x, y: on.y }, { x: node.x, y: node.y }] });
+            }
+          }
+        }
       }
+    }
 
-      if (minDS > 18.0 * 18.0 || minDG > 18.0 * 18.0) return null;
-      if (uStart === vGoal) return [{ x: sx, y: sy }, topoNodes[uStart], { x: gx, y: gy }];
+    function findNearestRamp(px, py, maxDist) {
+      const bx = Math.max(0, Math.min(gw - 1, (px / gridSize) | 0));
+      const by = Math.max(0, Math.min(gh - 1, (py / gridSize) | 0));
+      let bestIdx = -1, bestD = maxDist * maxDist;
+      const radCells = Math.ceil(maxDist / gridSize);
 
-      const dist = new Float32Array(topoNodes.length);
+      for (let dy = -radCells; dy <= radCells; dy++) {
+        const cy = by + dy;
+        if (cy < 0 || cy >= gh) continue;
+        const rOff = cy * gw;
+        for (let dx = -radCells; dx <= radCells; dx++) {
+          const cx = bx + dx;
+          if (cx < 0 || cx >= gw) continue;
+          const bucket = spatialBuckets[rOff + cx];
+          for (let k = 0; k < bucket.length; k++) {
+            const nIdx = bucket[k];
+            const hn = highwayNodes[nIdx];
+            const dSq = (hn.x - px) ** 2 + (hn.y - py) ** 2;
+            if (dSq < bestD) {
+              bestD = dSq;
+              bestIdx = nIdx;
+            }
+          }
+        }
+      }
+      return bestIdx;
+    }
+
+    // Fast Dijkstra on Compressed Highway Dictionary (< 1,000 nodes, < 0.1ms!)
+    function queryHighway(startIdx, goalIdx) {
+      if (startIdx === goalIdx) return [];
+      const numN = highwayNodes.length;
+      const dist = new Float32Array(numN);
       dist.fill(1e9);
-      const parent = new Int32Array(topoNodes.length);
+      const parent = new Int32Array(numN);
       parent.fill(-1);
       const parentPts = [];
-      parentPts.length = topoNodes.length;
+      parentPts.length = numN;
 
-      dist[uStart] = 0;
-      const pq = [uStart, 0.0]; // [node, dist, ...]
+      dist[startIdx] = 0;
+      const pq = [startIdx, 0.0];
 
-      let found = false;
       while (pq.length > 0) {
         let bestI = 0, bestD = pq[1];
         for (let i = 3; i < pq.length; i += 2) {
@@ -1545,16 +1677,13 @@
         pq[bestI + 1] = pq[pq.length - 1];
         pq.length -= 2;
 
-        if (curr === vGoal) { found = true; break; }
+        if (curr === goalIdx) break;
         const cDist = dist[curr];
 
-        const edges = topoAdj[curr];
+        const edges = highwayAdj[curr];
         for (let i = 0; i < edges.length; i++) {
           const e = edges[i];
-          const isDrawn = drawnEdges.has(e.eId);
-          // Physarum Slime Mold resistance law: drawn tubes have near-zero resistance
-          const resistance = isDrawn ? 0.002 : e.len * 2.0;
-          const nc = cDist + resistance;
+          const nc = cDist + e.cost;
           if (nc < dist[e.to]) {
             dist[e.to] = nc;
             parent[e.to] = curr;
@@ -1564,123 +1693,26 @@
         }
       }
 
-      if (!found || dist[vGoal] > 90.0) return null;
+      if (dist[goalIdx] >= 1e9) return null;
 
       const path = [];
-      let c = vGoal;
+      let c = goalIdx;
       while (c !== -1 && parent[c] !== -1) {
         const pts = parentPts[c];
         for (let k = pts.length - 1; k >= 1; k--) path.push(pts[k]);
         c = parent[c];
       }
-      path.push(topoNodes[uStart]);
+      path.push(highwayNodes[startIdx]);
       path.reverse();
-      return [{ x: sx, y: sy }, ...path, { x: gx, y: gy }];
-    }
-
-    // Tier 2: Bounded Stealth A* Fallback
-    function findStealthPath(sx, sy, gx, gy) {
-      sx = Math.max(0, Math.min(W - 1, Math.round(sx)));
-      sy = Math.max(0, Math.min(H - 1, Math.round(sy)));
-      gx = Math.max(0, Math.min(W - 1, Math.round(gx)));
-      gy = Math.max(0, Math.min(H - 1, Math.round(gy)));
-      if (sx === gx && sy === gy) return [{ x: gx, y: gy }];
-
-      // Try Tier 1 Physarum Graph Dijkstra (< 0.1ms)
-      const t1Path = physarumGraphDijkstra(sx, sy, gx, gy);
-      if (t1Path) return t1Path;
-
-      const dist = new Float32Array(W * H);
-      dist.fill(1e9);
-      const parent = new Int32Array(W * H);
-      parent.fill(-1);
-
-      const startIdx = sy * W + sx;
-      const goalIdx = gy * W + gx;
-      dist[startIdx] = 0;
-
-      const pq = [startIdx, Math.hypot(sx - gx, sy - gy)];
-      let iters = 0;
-      let found = false;
-
-      while (pq.length > 0 && iters < 8000) {
-        iters++;
-        let bestI = 0;
-        let bestF = pq[1];
-        for (let i = 3; i < pq.length; i += 2) {
-          if (pq[i] < bestF) {
-            bestF = pq[i];
-            bestI = i - 1;
-          }
-        }
-        const curr = pq[bestI];
-        pq[bestI] = pq[pq.length - 2];
-        pq[bestI + 1] = pq[pq.length - 1];
-        pq.length -= 2;
-
-        if (curr === goalIdx) {
-          found = true;
-          break;
-        }
-
-        const cx = curr % W;
-        const cy = (curr / W) | 0;
-        const cDist = dist[curr];
-
-        for (let dy = -1; dy <= 1; dy++) {
-          const ny = cy + dy;
-          if (ny < 0 || ny >= H) continue;
-          const rOff = ny * W;
-          for (let dx = -1; dx <= 1; dx++) {
-            if (dx === 0 && dy === 0) continue;
-            const nx = cx + dx;
-            if (nx < 0 || nx >= W) continue;
-            const nIdx = rOff + nx;
-            const stepLen = (dx !== 0 && dy !== 0) ? 1.414 : 1.0;
-            const nc = cDist + costMap[nIdx] * stepLen;
-
-            if (nc < dist[nIdx]) {
-              dist[nIdx] = nc;
-              parent[nIdx] = curr;
-              pq.push(nIdx, nc + Math.hypot(nx - gx, ny - gy));
-            }
-          }
-        }
-      }
-
-      const path = [];
-      if (found) {
-        let c = goalIdx;
-        while (c !== -1) {
-          path.push({ x: c % W, y: (c / W) | 0 });
-          c = parent[c];
-        }
-        path.reverse();
-      } else {
-        path.push({ x: sx, y: H - 1 });
-        path.push({ x: gx, y: H - 1 });
-        path.push({ x: gx, y: gy });
-      }
       return path;
     }
 
     const path = [];
-    let curX = 0;
-    let curY = H - 1;
-    path.push({ x: curX, y: curY });
+    let curX = 0, curY = H - 1;
+    let curRampIdx = cBL;
+    path.push({ x: curX, y: curY, w: 1.0 });
 
-    function addStealthMove(tx, ty) {
-      const transit = findStealthPath(curX, curY, tx, ty);
-      for (let i = 1; i < transit.length; i++) {
-        const pt = transit[i];
-        path.push({ x: pt.x, y: pt.y, w: 1.0 });
-        costMap[pt.y * W + pt.x] = 0.005; // Mark highway permanently free
-      }
-      curX = tx;
-      curY = ty;
-    }
-
-    // 7. Chain Closed Loops & Open Strokes (Watertight Gestalt Priority)
+    // 7. Chain Elements and Register Highway Tokens dynamically
     if (allElements.length > 0) {
       const unvisited = new Set(allElements.keys());
       let bestIdx = 0, bestY = -1;
@@ -1709,12 +1741,10 @@
 
         let sampleCount = 0;
         for (let idx of unvisited) {
-          if (sampleCount++ > 40) break;
+          if (sampleCount++ > 30) break;
           const el = allElements[idx];
           const pts = el.pts;
-          // Priority bonus for closed loops: ensures watertight boundaries are solidified first
           const typeBonus = el.type === 'loop' ? 0.75 : 1.0;
-
           const dH = Math.hypot(lastPt.x - pts[0].x, lastPt.y - pts[0].y) * typeBonus;
           const dT = Math.hypot(lastPt.x - pts[pts.length - 1].x, lastPt.y - pts[pts.length - 1].y) * typeBonus;
 
@@ -1738,22 +1768,55 @@
       }
 
       for (let el of orderedElements) {
-        addStealthMove(el.pts[0].x, el.pts[0].y);
+        const targetPt = el.pts[0];
+        const directDist = Math.hypot(curX - targetPt.x, curY - targetPt.y);
+
+        if (directDist <= 14.0) {
+          path.push({ x: targetPt.x, y: targetPt.y, w: 1.0 });
+        } else {
+          // Highway Dictionary LUT Query
+          const rampGoal = findNearestRamp(targetPt.x, targetPt.y, 140.0);
+          let connected = false;
+          if (rampGoal !== -1 && curRampIdx !== -1) {
+            const hwPath = queryHighway(curRampIdx, rampGoal);
+            if (hwPath && hwPath.length > 0) {
+              for (let i = 1; i < hwPath.length; i++) {
+                path.push({ x: hwPath[i].x, y: hwPath[i].y, w: 1.0 });
+              }
+              path.push({ x: targetPt.x, y: targetPt.y, w: 1.0 });
+              connected = true;
+            }
+          }
+
+          if (!connected) {
+            // Micro-stitch directly to nearest endpoint without vertical lines
+            path.push({ x: targetPt.x, y: targetPt.y, w: 1.0 });
+          }
+        }
+
+        // Draw Element
         const elWeight = el.weight || 1.0;
         for (let pt of el.pts) {
           path.push({ x: pt.x, y: pt.y, w: elWeight });
-          const px = Math.round(pt.x), py = Math.round(pt.y);
-          if (px >= 0 && px < W && py >= 0 && py < H) {
-            costMap[py * W + px] = 0.005; // Scratched groove becomes free highway
-          }
         }
+
+        // Register Drawn Stroke as a Highway Token in Dictionary!
+        const uNew = addHwNode(el.pts[0].x, el.pts[0].y);
+        const vNew = addHwNode(el.pts[el.pts.length - 1].x, el.pts[el.pts.length - 1].y);
+        registerHwNode(uNew); autoLinkNearby(uNew);
+        registerHwNode(vNew); autoLinkNearby(vNew);
+        highwayAdj[uNew].push({ to: vNew, cost: 0.001, pts: el.pts });
+        const revPts = el.pts.slice().reverse();
+        highwayAdj[vNew].push({ to: uNew, cost: 0.001, pts: revPts });
+
         curX = el.pts[el.pts.length - 1].x;
         curY = el.pts[el.pts.length - 1].y;
+        curRampIdx = vNew;
       }
     }
 
     // 8. Clean Return to Bottom Rail Origin (Pen Lifts: 0)
-    addStealthMove(curX, H - 1);
+    path.push({ x: curX, y: H - 1, w: 1.0 });
     path.push({ x: 0, y: H - 1, w: 1.0 });
 
     // 9. Object-Consistent Weight Retention & Negative Space Jitter Damping
