@@ -680,6 +680,8 @@
     // 1. Resample source image to (W, H) grayscale and darkness arrays
     const gray = new Float32Array(W * H);
     const darkness = new Float32Array(W * H);
+    let whiteCount = 0;
+    let lineCount = 0;
 
     for (let y = 0; y < H; y++) {
       const sy = Math.min(Math.floor((y / H) * srcH), srcH - 1);
@@ -690,7 +692,16 @@
         const lum = (srcData[sIdx] * 0.299 + srcData[sIdx + 1] * 0.587 + srcData[sIdx + 2] * 0.114) / 255.0;
         gray[rowW + x] = lum;
         darkness[rowW + x] = Math.max(0.0, Math.min(1.0, 1.0 - lum));
+        if (lum > 0.88) whiteCount++;
+        if (lum < 0.65) lineCount++;
       }
+    }
+
+    // Auto-detect Line-art / Sketch: mostly white paper with sparse crisp lines
+    const totalPixels = W * H;
+    const isSketchDetected = opt.isSketch || (opt.autoSketch !== false && (whiteCount / totalPixels > 0.78) && (lineCount / totalPixels < 0.22));
+    if (isSketchDetected) {
+      return generateSketchPlotterPath(targetWidth, targetHeight, sourceImgData, opts);
     }
 
     // 2. Sobel Edge Magnitude
@@ -1080,12 +1091,439 @@
     return out;
   }
 
+  /**
+   * =========================================================================
+   * Sketch Masterpiece Plotter Engine (Topological Skeleton Eulerian Walk)
+   * =========================================================================
+   * [EN] Zero-lift single continuous stroke Etch A Sketch line-art/sketch generator.
+   *      - Difference of Gaussians (DoG) for pencil/ink line isolation without lighting noise.
+   *      - Morphological thinning (skeletonization) to 1px medial axis graph.
+   *      - Topological junction/branch parsing and Eulerian assembly.
+   *      - Stealth zero-damage retraversal along already-drawn grooves (Pen Lifts: 0).
+   * [KO] 단일 획 무절단(Pen Lifts: 0) 스케치/선화 전용 에치 어 스케치 플로터 엔진.
+   *      - DoG(가우시안 차분) 필터를 통해 배경 조명 편차를 제거하고 잉크/연필선만 정밀 분리.
+   *      - 형태학적 세선화(스켈레톤)를 통한 1픽셀 중심축 위상 그래프 구축.
+   *      - 분기점/끝점 파싱 및 오일러 회로 조립.
+   *      - 이미 긁어낸 홈(Groove)과 베젤 레일을 통한 은밀한 역추적으로 흰색 종이 훼손 0.
+   */
+  function generateSketchPlotterPath(targetWidth, targetHeight, sourceImgData, opts) {
+    const W = targetWidth;
+    const H = targetHeight;
+    const opt = opts || {};
+    const humanize = opt.humanize !== false;
+
+    const srcW = sourceImgData.width;
+    const srcH = sourceImgData.height;
+    const srcData = sourceImgData.data;
+
+    // 1. Resample source image to (W, H) grayscale and compute saturation / line density
+    const gray = new Float32Array(W * H);
+    const darkness = new Float32Array(W * H);
+    const gray8 = new Uint8Array(W * H);
+
+    for (let y = 0; y < H; y++) {
+      const sy = Math.min(Math.floor((y / H) * srcH), srcH - 1);
+      const rowW = y * W;
+      for (let x = 0; x < W; x++) {
+        const sx = Math.min(Math.floor((x / W) * srcW), srcW - 1);
+        const sIdx = (sy * srcW + sx) * 4;
+        const lum = (srcData[sIdx] * 0.299 + srcData[sIdx + 1] * 0.587 + srcData[sIdx + 2] * 0.114) / 255.0;
+        gray[rowW + x] = lum;
+        darkness[rowW + x] = Math.max(0.0, Math.min(1.0, 1.0 - lum));
+        gray8[rowW + x] = Math.round(lum * 255);
+      }
+    }
+
+    // 2. High-precision Difference of Gaussians (DoG) filter
+    // Separable Gaussian blur 1 (sigma ~ 0.8, radius 2) and blur 2 (sigma ~ 2.5, radius 5)
+    function gaussianBlur(src, w, h, radius) {
+      const dst = new Float32Array(w * h);
+      const temp = new Float32Array(w * h);
+      const kernel = [];
+      const sigma = radius / 2.0;
+      let sum = 0;
+      for (let i = -radius; i <= radius; i++) {
+        const v = Math.exp(-(i * i) / (2 * sigma * sigma));
+        kernel.push(v);
+        sum += v;
+      }
+      for (let i = 0; i < kernel.length; i++) kernel[i] /= sum;
+
+      // Horizontal pass
+      for (let y = 0; y < h; y++) {
+        const row = y * w;
+        for (let x = 0; x < w; x++) {
+          let acc = 0;
+          for (let k = -radius; k <= radius; k++) {
+            const nx = Math.max(0, Math.min(w - 1, x + k));
+            acc += src[row + nx] * kernel[k + radius];
+          }
+          temp[row + x] = acc;
+        }
+      }
+      // Vertical pass
+      for (let y = 0; y < h; y++) {
+        const row = y * w;
+        for (let x = 0; x < w; x++) {
+          let acc = 0;
+          for (let k = -radius; k <= radius; k++) {
+            const ny = Math.max(0, Math.min(h - 1, y + k));
+            acc += temp[ny * w + x] * kernel[k + radius];
+          }
+          dst[row + x] = acc;
+        }
+      }
+      return dst;
+    }
+
+    const g1 = gaussianBlur(gray, W, H, 2);
+    const g2 = gaussianBlur(gray, W, H, 5);
+    const binMask = new Uint8Array(W * H);
+
+    for (let i = 0; i < W * H; i++) {
+      const dog = g2[i] - g1[i];
+      // Positive dog means line edge, or if pixel itself is distinctly dark
+      if (dog > 0.026 || gray8[i] < 165) {
+        binMask[i] = 1;
+      }
+    }
+
+    // 3. Fast Morphological Thinning (Skeletonization)
+    const skel = new Uint8Array(W * H);
+    let curImg = new Uint8Array(binMask);
+    const eroded = new Uint8Array(W * H);
+
+    for (let iter = 0; iter < 50; iter++) {
+      // 3x3 Cross erosion
+      let nonZero = 0;
+      for (let y = 0; y < H; y++) {
+        const row = y * W;
+        for (let x = 0; x < W; x++) {
+          const idx = row + x;
+          if (curImg[idx] === 0) {
+            eroded[idx] = 0;
+            continue;
+          }
+          const up    = y > 0 ? curImg[idx - W] : 0;
+          const down  = y < H - 1 ? curImg[idx + W] : 0;
+          const left  = x > 0 ? curImg[idx - 1] : 0;
+          const right = x < W - 1 ? curImg[idx + 1] : 0;
+
+          if (up && down && left && right) {
+            eroded[idx] = 1;
+            nonZero++;
+          } else {
+            eroded[idx] = 0;
+          }
+        }
+      }
+
+      // Dilate eroded by cross
+      for (let y = 0; y < H; y++) {
+        const row = y * W;
+        for (let x = 0; x < W; x++) {
+          const idx = row + x;
+          let dilated = eroded[idx];
+          if (!dilated) {
+            if (y > 0 && eroded[idx - W]) dilated = 1;
+            else if (y < H - 1 && eroded[idx + W]) dilated = 1;
+            else if (x > 0 && eroded[idx - 1]) dilated = 1;
+            else if (x < W - 1 && eroded[idx + 1]) dilated = 1;
+          }
+          // skel += curImg - dilated
+          if (curImg[idx] && !dilated) {
+            skel[idx] = 1;
+          }
+        }
+      }
+
+      curImg.set(eroded);
+      if (nonZero === 0) break;
+    }
+
+    // 4. Topological Branch Extraction
+    // Neighbor counts on 8-neighborhood
+    const neighbors = new Uint8Array(W * H);
+    for (let y = 1; y < H - 1; y++) {
+      const row = y * W;
+      for (let x = 1; x < W - 1; x++) {
+        const idx = row + x;
+        if (!skel[idx]) continue;
+        let c = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          const rOff = (y + dy) * W;
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            if (skel[rOff + x + dx]) c++;
+          }
+        }
+        neighbors[idx] = c;
+      }
+    }
+
+    // Clean lines by breaking at junctions (neighbors >= 3)
+    const cleanLines = new Uint8Array(skel);
+    for (let i = 0; i < W * H; i++) {
+      if (neighbors[i] >= 3) cleanLines[i] = 0;
+    }
+
+    // Extract connected branch strokes
+    const visitedBranch = new Uint8Array(W * H);
+    const branches = [];
+
+    for (let y = 2; y < H - 2; y++) {
+      const row = y * W;
+      for (let x = 2; x < W - 2; x++) {
+        const rootIdx = row + x;
+        if (cleanLines[rootIdx] && !visitedBranch[rootIdx]) {
+          const pts = [];
+          let cx = x, cy = y;
+          visitedBranch[rootIdx] = 1;
+          pts.push({ x: cx, y: cy });
+
+          // Walk along branch
+          for (let step = 0; step < 600; step++) {
+            let nextX = -1, nextY = -1;
+            for (let dy = -1; dy <= 1; dy++) {
+              const rOff = (cy + dy) * W;
+              for (let dx = -1; dx <= 1; dx++) {
+                if (dx === 0 && dy === 0) continue;
+                const tx = cx + dx;
+                const ty = cy + dy;
+                const nIdx = rOff + tx;
+                if (tx >= 1 && tx < W - 1 && ty >= 1 && ty < H - 1 && cleanLines[nIdx] && !visitedBranch[nIdx]) {
+                  nextX = tx;
+                  nextY = ty;
+                  break;
+                }
+              }
+              if (nextX !== -1) break;
+            }
+            if (nextX === -1) break;
+            cx = nextX;
+            cy = nextY;
+            visitedBranch[cy * W + cx] = 1;
+            pts.push({ x: cx, y: cy });
+          }
+
+          if (pts.length >= 3) {
+            // Decimate points slightly to retain curvature without staircasing
+            const simplified = [pts[0]];
+            for (let i = 1; i < pts.length - 1; i += 2) {
+              simplified.push(pts[i]);
+            }
+            simplified.push(pts[pts.length - 1]);
+            branches.push(simplified);
+          }
+        }
+      }
+    }
+
+    // 5. Stealth A* Cost Map
+    // Paper: 1500.0, Drawn strokes: 0.05, Perimeter Rails: 0.1
+    const costMap = new Float32Array(W * H);
+    for (let i = 0; i < W * H; i++) {
+      const invD = 1.0 - darkness[i];
+      costMap[i] = 1.0 + (invD * invD) * 1500.0;
+    }
+    for (let x = 0; x < W; x++) {
+      costMap[(H - 1) * W + x] = 0.1;
+      costMap[x] = 0.1;
+    }
+    for (let y = 0; y < H; y++) {
+      costMap[y * W] = 0.1;
+      costMap[y * W + (W - 1)] = 0.1;
+    }
+
+    function findStealthPath(sx, sy, gx, gy) {
+      sx = Math.max(0, Math.min(W - 1, Math.round(sx)));
+      sy = Math.max(0, Math.min(H - 1, Math.round(sy)));
+      gx = Math.max(0, Math.min(W - 1, Math.round(gx)));
+      gy = Math.max(0, Math.min(H - 1, Math.round(gy)));
+      if (sx === gx && sy === gy) return [{ x: gx, y: gy }];
+
+      const dist = new Float32Array(W * H);
+      dist.fill(1e9);
+      const parent = new Int32Array(W * H);
+      parent.fill(-1);
+
+      const startIdx = sy * W + sx;
+      const goalIdx = gy * W + gx;
+      dist[startIdx] = 0;
+
+      const pq = [startIdx, Math.hypot(sx - gx, sy - gy)];
+      let iters = 0;
+      let found = false;
+
+      while (pq.length > 0 && iters < 8000) {
+        iters++;
+        // Pop lowest f-score
+        let bestI = 0;
+        let bestF = pq[1];
+        for (let i = 3; i < pq.length; i += 2) {
+          if (pq[i] < bestF) {
+            bestF = pq[i];
+            bestI = i - 1;
+          }
+        }
+        const curr = pq[bestI];
+        pq[bestI] = pq[pq.length - 2];
+        pq[bestI + 1] = pq[pq.length - 1];
+        pq.length -= 2;
+
+        if (curr === goalIdx) {
+          found = true;
+          break;
+        }
+
+        const cx = curr % W;
+        const cy = (curr / W) | 0;
+        const cDist = dist[curr];
+
+        for (let dy = -1; dy <= 1; dy++) {
+          const ny = cy + dy;
+          if (ny < 0 || ny >= H) continue;
+          const rOff = ny * W;
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const nx = cx + dx;
+            if (nx < 0 || nx >= W) continue;
+            const nIdx = rOff + nx;
+            const stepLen = (dx !== 0 && dy !== 0) ? 1.414 : 1.0;
+            const nc = cDist + costMap[nIdx] * stepLen;
+
+            if (nc < dist[nIdx]) {
+              dist[nIdx] = nc;
+              parent[nIdx] = curr;
+              pq.push(nIdx, nc + Math.hypot(nx - gx, ny - gy));
+            }
+          }
+        }
+      }
+
+      const path = [];
+      if (found) {
+        let c = goalIdx;
+        while (c !== -1) {
+          path.push({ x: c % W, y: (c / W) | 0 });
+          c = parent[c];
+        }
+        path.reverse();
+      } else {
+        path.push({ x: sx, y: H - 1 });
+        path.push({ x: gx, y: H - 1 });
+        path.push({ x: gx, y: gy });
+      }
+      return path;
+    }
+
+    const path = [];
+    let curX = 0;
+    let curY = H - 1;
+    path.push({ x: curX, y: curY });
+
+    function addStealthMove(tx, ty) {
+      const transit = findStealthPath(curX, curY, tx, ty);
+      for (let i = 1; i < transit.length; i++) {
+        const pt = transit[i];
+        path.push(pt);
+        costMap[pt.y * W + pt.x] = 0.05;
+      }
+      curX = tx;
+      curY = ty;
+    }
+
+    // 6. Chain Branches by Nearest Endpoints
+    if (branches.length > 0) {
+      const unvisited = new Set(branches.keys());
+      let bestB = 0, bestY = -1;
+      for (let i of unvisited) {
+        const b = branches[i];
+        const maxY = Math.max(b[0].y, b[b.length - 1].y);
+        if (maxY > bestY) {
+          bestY = maxY;
+          bestB = i;
+        }
+      }
+
+      let curBranch = branches[bestB];
+      unvisited.delete(bestB);
+      if (curBranch[0].y < curBranch[curBranch.length - 1].y) {
+        curBranch.reverse();
+      }
+
+      const orderedBranches = [curBranch];
+      while (unvisited.size > 0) {
+        const lastPt = orderedBranches[orderedBranches.length - 1][orderedBranches[orderedBranches.length - 1].length - 1];
+        let bestDist = 1e9;
+        let candIdx = -1;
+        let shouldRev = false;
+
+        for (let idx of unvisited) {
+          const b = branches[idx];
+          const dH = Math.hypot(lastPt.x - b[0].x, lastPt.y - b[0].y);
+          const dT = Math.hypot(lastPt.x - b[b.length - 1].x, lastPt.y - b[b.length - 1].y);
+          if (dH < bestDist) {
+            bestDist = dH;
+            candIdx = idx;
+            shouldRev = false;
+          }
+          if (dT < bestDist) {
+            bestDist = dT;
+            candIdx = idx;
+            shouldRev = true;
+          }
+        }
+
+        if (candIdx === -1) break;
+        const cand = branches[candIdx];
+        if (shouldRev) cand.reverse();
+        orderedBranches.push(cand);
+        unvisited.delete(candIdx);
+      }
+
+      for (let b of orderedBranches) {
+        addStealthMove(b[0].x, b[0].y);
+        for (let pt of b) {
+          path.push(pt);
+          costMap[pt.y * W + pt.x] = 0.05;
+        }
+        curX = b[b.length - 1].x;
+        curY = b[b.length - 1].y;
+      }
+    }
+
+    // 7. Clean Return to Bottom Rail Origin (Pen Lifts: 0)
+    addStealthMove(curX, H - 1);
+    path.push({ x: 0, y: H - 1 });
+
+    if (!humanize) return path;
+
+    // 8. Humanized mechanical micro-jitter
+    const out = [];
+    for (let i = 0; i < path.length; i++) {
+      const p = path[i];
+      if (p.x <= 1 || p.x >= W - 2 || p.y <= 1 || p.y >= H - 2) {
+        out.push(p);
+      } else {
+        const jx = smoothNoise1D(i * 0.22) * 0.2;
+        const jy = smoothNoise1D(i * 0.22 + 51.3) * 0.2;
+        out.push({
+          x: Math.round((p.x + jx) * 10) / 10,
+          y: Math.round((p.y + jy) * 10) / 10
+        });
+      }
+    }
+    return out;
+  }
+
   return {
     screentone,
     applyToImageData,
     generateEulerianHatch,
     generateEtchbotTSP,
     generateMasterpiecePlotterPath,
+    generateSketchPlotterPath,
     BAYER_4X4,
     BAYER_8X8
   };
