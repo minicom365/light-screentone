@@ -1587,298 +1587,257 @@
       }
     }
 
-    // 6. Dictionary-Based Highway LUT Routing (Sub-10ms Acceleration)
-    // Replaces 786k-node Grid A* with Compressed Highway Tokens (TraceIt Path Reuse)
-    const highwayNodes = [];
-    const highwayAdj = [];
+    // 6. Connected Core Component & MST Eulerian Tree Router (Zero Canvas Exposure)
+    const N_all = allElements.length;
+    if (N_all === 0) return [{ x: 0, y: H - 1, w: 1.0 }, { x: 0, y: H - 1, w: 1.0 }];
 
-    function addHwNode(x, y) {
-      const idx = highwayNodes.length;
-      highwayNodes.push({ x: +x, y: +y });
-      highwayAdj.push([]);
-      return idx;
+    // Sample points per element for fast spatial distance
+    const elemSamples = [];
+    for (let i = 0; i < N_all; i++) {
+      const pts = allElements[i].pts;
+      const step = Math.max(1, (pts.length / 10) | 0);
+      const samples = [];
+      const sampleIndices = [];
+      for (let k = 0; k < pts.length; k += step) {
+        samples.push(pts[k]);
+        sampleIndices.push(k);
+      }
+      if (sampleIndices[sampleIndices.length - 1] !== pts.length - 1) {
+        samples.push(pts[pts.length - 1]);
+        sampleIndices.push(pts.length - 1);
+      }
+      elemSamples.push({ samples, sampleIndices });
     }
 
-    // Base alphabet: 4 Corners and Perimeter Rails
-    const cTL = addHwNode(0, 0);
-    const cTR = addHwNode(W - 1, 0);
-    const cBR = addHwNode(W - 1, H - 1);
-    const cBL = addHwNode(0, H - 1);
+    // Dense pairwise distances
+    const distMatrix = Array.from({ length: N_all }, () => new Float32Array(N_all).fill(1e6));
+    const bestConnect = new Map();
 
-    const railCost = 0.001; // Behind bezel plastic: zero visual exposure!
-    highwayAdj[cTL].push({ to: cTR, cost: (W - 1) * railCost, pts: [{ x: 0, y: 0 }, { x: W - 1, y: 0 }] });
-    highwayAdj[cTR].push({ to: cTL, cost: (W - 1) * railCost, pts: [{ x: W - 1, y: 0 }, { x: 0, y: 0 }] });
-    highwayAdj[cTR].push({ to: cBR, cost: (H - 1) * railCost, pts: [{ x: W - 1, y: 0 }, { x: W - 1, y: H - 1 }] });
-    highwayAdj[cBR].push({ to: cTR, cost: (H - 1) * railCost, pts: [{ x: W - 1, y: H - 1 }, { x: W - 1, y: 0 }] });
-    highwayAdj[cBR].push({ to: cBL, cost: (W - 1) * railCost, pts: [{ x: W - 1, y: H - 1 }, { x: 0, y: H - 1 }] });
-    highwayAdj[cBL].push({ to: cBR, cost: (W - 1) * railCost, pts: [{ x: 0, y: H - 1 }, { x: W - 1, y: H - 1 }] });
-    highwayAdj[cBL].push({ to: cTL, cost: (H - 1) * railCost, pts: [{ x: 0, y: H - 1 }, { x: 0, y: 0 }] });
-    highwayAdj[cTL].push({ to: cBL, cost: (H - 1) * railCost, pts: [{ x: 0, y: 0 }, { x: 0, y: H - 1 }] });
-
-    // Spatial hash grid for O(1) ramp lookup
-    const gridSize = 32;
-    const gw = Math.ceil(W / gridSize);
-    const gh = Math.ceil(H / gridSize);
-    const spatialBuckets = Array.from({ length: gw * gh }, () => []);
-
-    function registerHwNode(nIdx) {
-      const node = highwayNodes[nIdx];
-      const bx = Math.max(0, Math.min(gw - 1, (node.x / gridSize) | 0));
-      const by = Math.max(0, Math.min(gh - 1, (node.y / gridSize) | 0));
-      spatialBuckets[by * gw + bx].push(nIdx);
-    }
-
-    for (let i = 0; i < 4; i++) registerHwNode(i);
-
-    function autoLinkNearby(nIdx, maxLinkDist) {
-      maxLinkDist = maxLinkDist || 38.0;
-      const node = highwayNodes[nIdx];
-      const bx = Math.max(0, Math.min(gw - 1, (node.x / gridSize) | 0));
-      const by = Math.max(0, Math.min(gh - 1, (node.y / gridSize) | 0));
-      const radCells = Math.ceil(maxLinkDist / gridSize);
-      const dSqMax = maxLinkDist * maxLinkDist;
-
-      for (let dy = -radCells; dy <= radCells; dy++) {
-        const cy = by + dy;
-        if (cy < 0 || cy >= gh) continue;
-        const rOff = cy * gw;
-        for (let dx = -radCells; dx <= radCells; dx++) {
-          const cx = bx + dx;
-          if (cx < 0 || cx >= gw) continue;
-          const bucket = spatialBuckets[rOff + cx];
-          for (let k = 0; k < bucket.length; k++) {
-            const oIdx = bucket[k];
-            if (oIdx === nIdx) continue;
-            const on = highwayNodes[oIdx];
-            const dSq = (on.x - node.x) ** 2 + (on.y - node.y) ** 2;
-            if (dSq <= dSqMax) {
-              const dist = Math.sqrt(dSq);
-              highwayAdj[nIdx].push({ to: oIdx, cost: dist * 0.01, pts: [{ x: node.x, y: node.y }, { x: on.x, y: on.y }] });
-              highwayAdj[oIdx].push({ to: nIdx, cost: dist * 0.01, pts: [{ x: on.x, y: on.y }, { x: node.x, y: node.y }] });
+    for (let i = 0; i < N_all; i++) {
+      const sI = elemSamples[i].samples;
+      const idxsI = elemSamples[i].sampleIndices;
+      for (let j = i + 1; j < N_all; j++) {
+        const sJ = elemSamples[j].samples;
+        const idxsJ = elemSamples[j].sampleIndices;
+        let minD = 1e6;
+        let bestI = 0, bestJ = 0;
+        for (let a = 0; a < sI.length; a++) {
+          const pa = sI[a];
+          for (let b = 0; b < sJ.length; b++) {
+            const pb = sJ[b];
+            const d = Math.hypot(pa.x - pb.x, pa.y - pb.y);
+            if (d < minD) {
+              minD = d;
+              bestI = idxsI[a];
+              bestJ = idxsJ[b];
             }
           }
         }
+        distMatrix[i][j] = minD;
+        distMatrix[j][i] = minD;
+        bestConnect.set(`${i},${j}`, [bestI, bestJ]);
+        bestConnect.set(`${j},${i}`, [bestJ, bestI]);
       }
     }
 
-    function findNearestRamp(px, py, maxDist) {
-      const bx = Math.max(0, Math.min(gw - 1, (px / gridSize) | 0));
-      const by = Math.max(0, Math.min(gh - 1, (py / gridSize) | 0));
-      let bestIdx = -1, bestD = maxDist * maxDist;
-      const radCells = Math.ceil(maxDist / gridSize);
-
-      for (let dy = -radCells; dy <= radCells; dy++) {
-        const cy = by + dy;
-        if (cy < 0 || cy >= gh) continue;
-        const rOff = cy * gw;
-        for (let dx = -radCells; dx <= radCells; dx++) {
-          const cx = bx + dx;
-          if (cx < 0 || cx >= gw) continue;
-          const bucket = spatialBuckets[rOff + cx];
-          for (let k = 0; k < bucket.length; k++) {
-            const nIdx = bucket[k];
-            const hn = highwayNodes[nIdx];
-            const dSq = (hn.x - px) ** 2 + (hn.y - py) ** 2;
-            if (dSq < bestD) {
-              bestD = dSq;
-              bestIdx = nIdx;
-            }
-          }
+    // Connected Component Analysis with 18.0px threshold
+    const adj18 = Array.from({ length: N_all }, () => []);
+    for (let i = 0; i < N_all; i++) {
+      for (let j = i + 1; j < N_all; j++) {
+        if (distMatrix[i][j] <= 18.0) {
+          adj18[i].push(j);
+          adj18[j].push(i);
         }
       }
-      return bestIdx;
     }
 
-    // Fast Dijkstra on Compressed Highway Dictionary (< 1,000 nodes, < 0.1ms!)
-    function queryHighway(startIdx, goalIdx) {
-      if (startIdx === goalIdx) return [];
-      const numN = highwayNodes.length;
-      const dist = new Float32Array(numN);
-      dist.fill(1e9);
-      const parent = new Int32Array(numN);
-      parent.fill(-1);
-      const parentPts = [];
-      parentPts.length = numN;
+    const compLabels = new Int32Array(N_all).fill(-1);
+    let numComp = 0;
+    const compSizes = [];
 
-      dist[startIdx] = 0;
-      const pq = [startIdx, 0.0];
-
-      while (pq.length > 0) {
-        let bestI = 0, bestD = pq[1];
-        for (let i = 3; i < pq.length; i += 2) {
-          if (pq[i] < bestD) { bestD = pq[i]; bestI = i - 1; }
-        }
-        const curr = pq[bestI];
-        pq[bestI] = pq[pq.length - 2];
-        pq[bestI + 1] = pq[pq.length - 1];
-        pq.length -= 2;
-
-        if (curr === goalIdx) break;
-        const cDist = dist[curr];
-
-        const edges = highwayAdj[curr];
-        for (let i = 0; i < edges.length; i++) {
-          const e = edges[i];
-          const nc = cDist + e.cost;
-          if (nc < dist[e.to]) {
-            dist[e.to] = nc;
-            parent[e.to] = curr;
-            parentPts[e.to] = e.pts;
-            pq.push(e.to, nc);
+    for (let i = 0; i < N_all; i++) {
+      if (compLabels[i] !== -1) continue;
+      let cSize = 0;
+      const q = [i];
+      compLabels[i] = numComp;
+      while (q.length > 0) {
+        const u = q.pop();
+        cSize++;
+        for (let v of adj18[u]) {
+          if (compLabels[v] === -1) {
+            compLabels[v] = numComp;
+            q.push(v);
           }
         }
       }
+      compSizes.push(cSize);
+      numComp++;
+    }
 
-      if (dist[goalIdx] >= 1e9) return null;
-
-      const path = [];
-      let c = goalIdx;
-      while (c !== -1 && parent[c] !== -1) {
-        const pts = parentPts[c];
-        for (let k = pts.length - 1; k >= 1; k--) path.push(pts[k]);
-        c = parent[c];
+    let largestCompId = 0;
+    let maxCSize = -1;
+    for (let c = 0; c < compSizes.length; c++) {
+      if (compSizes[c] > maxCSize) {
+        maxCSize = compSizes[c];
+        largestCompId = c;
       }
-      path.push(highwayNodes[startIdx]);
-      path.reverse();
-      return path;
+    }
+
+    // Keep core elements belonging to largest connected component
+    const coreIndices = [];
+    for (let i = 0; i < N_all; i++) {
+      if (compLabels[i] === largestCompId) coreIndices.push(i);
+    }
+    const coreElements = coreIndices.map(idx => allElements[idx]);
+    const N = coreElements.length;
+
+    // Build MST on Core using Prim's algorithm
+    const inMST = new Uint8Array(N);
+    const minEdgeCost = new Float32Array(N).fill(1e6);
+    const parentNode = new Int32Array(N).fill(-1);
+    const mstAdj = Array.from({ length: N }, () => []);
+
+    minEdgeCost[0] = 0;
+    for (let step = 0; step < N; step++) {
+      let u = -1, bestC = 1e6;
+      for (let i = 0; i < N; i++) {
+        if (!inMST[i] && minEdgeCost[i] < bestC) {
+          bestC = minEdgeCost[i];
+          u = i;
+        }
+      }
+      if (u === -1) break;
+      inMST[u] = 1;
+      if (parentNode[u] !== -1) {
+        const p = parentNode[u];
+        mstAdj[p].push(u);
+        mstAdj[u].push(p);
+      }
+
+      const origU = coreIndices[u];
+      for (let v = 0; v < N; v++) {
+        if (!inMST[v]) {
+          const origV = coreIndices[v];
+          const c = distMatrix[origU][origV];
+          if (c < minEdgeCost[v]) {
+            minEdgeCost[v] = c;
+            parentNode[v] = u;
+          }
+        }
+      }
+    }
+
+    // Root selection: bottom-most vertex for clean, single-point vertical entry/exit
+    let rootIdx = 0, rEntryIdx = 0, maxY = -1;
+    for (let i = 0; i < N; i++) {
+      const pts = coreElements[i].pts;
+      for (let k = 0; k < pts.length; k++) {
+        if (pts[k].y > maxY) {
+          maxY = pts[k].y;
+          rootIdx = i;
+          rEntryIdx = k;
+        }
+      }
     }
 
     const path = [];
-    let curX = 0, curY = H - 1;
-    let curRampIdx = cBL;
-    path.push({ x: curX, y: curY, w: 1.0 });
+    const rootPts = coreElements[rootIdx].pts;
+    const rStart = rootPts[rEntryIdx];
 
-    // 7. Chain Elements and Register Highway Tokens dynamically
-    if (allElements.length > 0) {
-      const unvisited = new Set(allElements.keys());
-      let bestIdx = 0, bestY = -1;
-      for (let i of unvisited) {
-        const el = allElements[i];
-        for (let p of el.pts) {
-          if (p.y > bestY) {
-            bestY = p.y;
-            bestIdx = i;
+    // Single Vertical Entry Line from Bottom Bezel Rail
+    path.push({ x: 0, y: H - 1, w: 1.0 });
+    path.push({ x: Math.round(rStart.x * 10) / 10, y: H - 1, w: 1.0 });
+    path.push({ x: Math.round(rStart.x * 10) / 10, y: Math.round(rStart.y * 10) / 10, w: 1.0 });
+
+    const visitedMST = new Uint8Array(N);
+
+    function traverseTree(u, entryIdx) {
+      visitedMST[u] = 1;
+      const uEl = coreElements[u];
+      const uPts = uEl.pts;
+      const uWeight = uEl.weight || 1.0;
+      const isLoop = (uEl.type === 'loop');
+      const nPts = uPts.length;
+      let curPosInU = entryIdx;
+
+      if (isLoop) {
+        for (let off = 1; off <= nPts; off++) {
+          const idx = (entryIdx + off) % nPts;
+          path.push({ x: Math.round(uPts[idx].x * 10) / 10, y: Math.round(uPts[idx].y * 10) / 10, w: uWeight });
+        }
+        curPosInU = entryIdx;
+      } else {
+        if (entryIdx > 0) {
+          for (let k = entryIdx - 1; k >= 0; k--) {
+            path.push({ x: Math.round(uPts[k].x * 10) / 10, y: Math.round(uPts[k].y * 10) / 10, w: 1.0 });
           }
         }
+        for (let k = 1; k < nPts; k++) {
+          path.push({ x: Math.round(uPts[k].x * 10) / 10, y: Math.round(uPts[k].y * 10) / 10, w: uWeight });
+        }
+        curPosInU = nPts - 1;
       }
 
-      let curEl = allElements[bestIdx];
-      unvisited.delete(bestIdx);
-      if (curEl.pts[0].y < curEl.pts[curEl.pts.length - 1].y) {
-        curEl.pts.reverse();
+      // Visit children ordered by position along u to minimize groove retracing
+      const origU = coreIndices[u];
+      const children = mstAdj[u].filter(v => !visitedMST[v]);
+      children.sort((a, b) => {
+        const origA = coreIndices[a], origB = coreIndices[b];
+        const connA = bestConnect.get(`${origU},${origA}`)[0];
+        const connB = bestConnect.get(`${origU},${origB}`)[0];
+        return connA - connB;
+      });
+
+      for (let v of children) {
+        if (visitedMST[v]) continue;
+        const origV = coreIndices[v];
+        const [uBranchIdx, vEntryIdx] = bestConnect.get(`${origU},${origV}`);
+
+        // 1. Retrace within u to branch point (cost 0.0)
+        if (curPosInU !== uBranchIdx) {
+          const step = uBranchIdx > curPosInU ? 1 : -1;
+          for (let k = curPosInU + step; k !== uBranchIdx + step; k += step) {
+            path.push({ x: Math.round(uPts[k].x * 10) / 10, y: Math.round(uPts[k].y * 10) / 10, w: 1.0 });
+          }
+          curPosInU = uBranchIdx;
+        }
+
+        // 2. Micro-stitch to child v (typically < 10px!)
+        const vPts = coreElements[v].pts;
+        const vPt = vPts[vEntryIdx];
+        path.push({ x: Math.round(vPt.x * 10) / 10, y: Math.round(vPt.y * 10) / 10, w: 1.0 });
+
+        // 3. Recurse into child v
+        const vExitIdx = traverseTree(v, vEntryIdx);
+
+        // 4. Retrace groove inside child v back to vEntryIdx (cost 0.0!)
+        if (vExitIdx !== vEntryIdx) {
+          const step = vEntryIdx > vExitIdx ? 1 : -1;
+          for (let k = vExitIdx + step; k !== vEntryIdx + step; k += step) {
+            path.push({ x: Math.round(vPts[k].x * 10) / 10, y: Math.round(vPts[k].y * 10) / 10, w: 1.0 });
+          }
+        }
+
+        // 5. Micro-stitch back from child vEntry to uBranchIdx
+        path.push({ x: Math.round(uPts[uBranchIdx].x * 10) / 10, y: Math.round(uPts[uBranchIdx].y * 10) / 10, w: 1.0 });
+        curPosInU = uBranchIdx;
       }
 
-      const orderedElements = [curEl];
-      while (unvisited.size > 0) {
-        const lastPt = orderedElements[orderedElements.length - 1].pts[orderedElements[orderedElements.length - 1].pts.length - 1];
-        let bestDist = 1e9;
-        let candIdx = -1;
-        let shouldRev = false;
+      return curPosInU;
+    }
 
-        let sampleCount = 0;
-        for (let idx of unvisited) {
-          if (sampleCount++ > 30) break;
-          const el = allElements[idx];
-          const pts = el.pts;
-          const typeBonus = el.type === 'loop' ? 0.75 : 1.0;
-          const dH = Math.hypot(lastPt.x - pts[0].x, lastPt.y - pts[0].y) * typeBonus;
-          const dT = Math.hypot(lastPt.x - pts[pts.length - 1].x, lastPt.y - pts[pts.length - 1].y) * typeBonus;
+    const finalUPos = traverseTree(rootIdx, rEntryIdx);
 
-          if (dH < bestDist) {
-            bestDist = dH;
-            candIdx = idx;
-            shouldRev = false;
-          }
-          if (dT < bestDist) {
-            bestDist = dT;
-            candIdx = idx;
-            shouldRev = true;
-          }
-        }
-
-        if (candIdx === -1) break;
-        const cand = allElements[candIdx];
-        if (shouldRev) cand.pts.reverse();
-        orderedElements.push(cand);
-        unvisited.delete(candIdx);
-      }
-
-      const drawnStrokeStack = [];
-
-      for (let el of orderedElements) {
-        const targetPt = el.pts[0];
-        const directDist = Math.hypot(curX - targetPt.x, curY - targetPt.y);
-
-        // CHEAPER DETOUR STRATEGY (Optimization 2):
-        // 1. Can we backtrack along the stroke we just drew to get closer with ZERO white-paper exposure?
-        let bestBacktrackIdx = -1;
-        let bestBacktrackDist = directDist;
-        if (drawnStrokeStack.length > 0) {
-          const lastDrawn = drawnStrokeStack[drawnStrokeStack.length - 1];
-          const step = Math.max(1, (lastDrawn.length / 10) | 0);
-          for (let k = lastDrawn.length - 1; k >= 0; k -= step) {
-            const bp = lastDrawn[k];
-            const dB2T = Math.hypot(bp.x - targetPt.x, bp.y - targetPt.y);
-            if (dB2T < bestBacktrackDist - 6.0) {
-              bestBacktrackDist = dB2T;
-              bestBacktrackIdx = k;
-            }
-          }
-        }
-
-        if (bestBacktrackIdx !== -1 && bestBacktrackDist < 20.0) {
-          // RETRACE GROOVE: Zero new visual lines on white paper!
-          const lastDrawn = drawnStrokeStack[drawnStrokeStack.length - 1];
-          for (let k = lastDrawn.length - 1; k >= bestBacktrackIdx; k--) {
-            path.push({ x: lastDrawn[k].x, y: lastDrawn[k].y, w: 1.0 });
-          }
-          path.push({ x: targetPt.x, y: targetPt.y, w: 1.0 });
-        } else if (directDist <= 16.0) {
-          path.push({ x: targetPt.x, y: targetPt.y, w: 1.0 });
-        } else {
-          // Highway Dictionary LUT Query (Detour via submerged rails/existing strokes)
-          const rampGoal = findNearestRamp(targetPt.x, targetPt.y, 240.0);
-          let connected = false;
-          if (rampGoal !== -1 && curRampIdx !== -1) {
-            const hwPath = queryHighway(curRampIdx, rampGoal);
-            if (hwPath && hwPath.length > 0) {
-              for (let i = 1; i < hwPath.length; i++) {
-                path.push({ x: hwPath[i].x, y: hwPath[i].y, w: 1.0 });
-              }
-              path.push({ x: targetPt.x, y: targetPt.y, w: 1.0 });
-              connected = true;
-            }
-          }
-
-          if (!connected) {
-            path.push({ x: targetPt.x, y: targetPt.y, w: 1.0 });
-          }
-        }
-
-        // Draw Element
-        const elWeight = el.weight || 1.0;
-        for (let pt of el.pts) {
-          path.push({ x: pt.x, y: pt.y, w: elWeight });
-        }
-        drawnStrokeStack.push(el.pts);
-
-        // Register Drawn Stroke as a Highway Token in Dictionary!
-        const uNew = addHwNode(el.pts[0].x, el.pts[0].y);
-        const vNew = addHwNode(el.pts[el.pts.length - 1].x, el.pts[el.pts.length - 1].y);
-        registerHwNode(uNew); autoLinkNearby(uNew);
-        registerHwNode(vNew); autoLinkNearby(vNew);
-        highwayAdj[uNew].push({ to: vNew, cost: 0.001, pts: el.pts });
-        const revPts = el.pts.slice().reverse();
-        highwayAdj[vNew].push({ to: uNew, cost: 0.001, pts: revPts });
-
-        curX = el.pts[el.pts.length - 1].x;
-        curY = el.pts[el.pts.length - 1].y;
-        curRampIdx = vNew;
+    // Retrace within root back to rEntryIdx for seamless single-line return!
+    if (finalUPos !== rEntryIdx) {
+      const step = rEntryIdx > finalUPos ? 1 : -1;
+      for (let k = finalUPos + step; k !== rEntryIdx + step; k += step) {
+        path.push({ x: Math.round(rootPts[k].x * 10) / 10, y: Math.round(rootPts[k].y * 10) / 10, w: 1.0 });
       }
     }
 
-    // 8. Clean Return to Bottom Rail Origin (Pen Lifts: 0)
-    path.push({ x: curX, y: H - 1, w: 1.0 });
+    // Return down the exact same vertical line to bottom rail origin!
+    path.push({ x: Math.round(rStart.x * 10) / 10, y: H - 1, w: 1.0 });
     path.push({ x: 0, y: H - 1, w: 1.0 });
 
     // 9. Object-Consistent Weight Retention & Negative Space Jitter Damping
