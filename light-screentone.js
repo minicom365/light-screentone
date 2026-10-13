@@ -1261,161 +1261,168 @@
       }
     }
 
-    // 5. Topological Branch Extraction with Saliency Budget Allocation
-    const neighbors = new Uint8Array(W * H);
-    for (let y = 1; y < H - 1; y++) {
-      const row = y * W;
-      for (let x = 1; x < W - 1; x++) {
-        const idx = row + x;
-        if (!skel[idx]) continue;
-        let c = 0;
-        for (let dy = -1; dy <= 1; dy++) {
-          const rOff = (y + dy) * W;
-          for (let dx = -1; dx <= 1; dx++) {
-            if (dx === 0 && dy === 0) continue;
-            if (skel[rOff + x + dx]) c++;
-          }
+    // 5. Watertight Closed-Loop Gestalt Silhouette Extraction (Zero Leakage)
+    // Polygon simplifier preserving closed loop integrity
+    function simplifyPoly(pts, tol) {
+      if (pts.length <= 2) return pts;
+      let dmax = 0, idx = 0;
+      const end = pts.length - 1;
+      const p1 = pts[0], p2 = pts[end];
+      const lineLen = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+
+      for (let i = 1; i < end; i++) {
+        let d = 0;
+        if (lineLen < 1e-6) {
+          d = Math.hypot(pts[i].x - p1.x, pts[i].y - p1.y);
+        } else {
+          const num = Math.abs((p2.y - p1.y) * pts[i].x - (p2.x - p1.x) * pts[i].y + p2.x * p1.y - p2.y * p1.x);
+          d = num / lineLen;
         }
-        neighbors[idx] = c;
+        if (d > dmax) { dmax = d; idx = i; }
+      }
+
+      if (dmax > tol) {
+        const rec1 = simplifyPoly(pts.slice(0, idx + 1), tol);
+        const rec2 = simplifyPoly(pts.slice(idx), tol);
+        return rec1.slice(0, rec1.length - 1).concat(rec2);
+      } else {
+        return [pts[0], pts[end]];
       }
     }
 
-    // Clean lines by breaking at junctions (neighbors >= 3)
-    const cleanLines = new Uint8Array(skel);
-    for (let i = 0; i < W * H; i++) {
-      if (neighbors[i] >= 3) cleanLines[i] = 0;
+    // Morphological close (2x2) on binMask to seal 1px micro-gaps before contouring
+    const closedMask = new Uint8Array(W * H);
+    const dilTemp = new Uint8Array(W * H);
+    for (let y = 0; y < H; y++) {
+      const row = y * W;
+      for (let x = 0; x < W; x++) {
+        if (binMask[row + x]) {
+          dilTemp[row + x] = 1;
+          if (x + 1 < W) dilTemp[row + x + 1] = 1;
+          if (y + 1 < H) {
+            dilTemp[(y + 1) * W + x] = 1;
+            if (x + 1 < W) dilTemp[(y + 1) * W + x + 1] = 1;
+          }
+        }
+      }
+    }
+    for (let y = 1; y < H; y++) {
+      const row = y * W;
+      for (let x = 1; x < W; x++) {
+        if (dilTemp[row + x] && dilTemp[row + x - 1] && dilTemp[(y - 1) * W + x] && dilTemp[(y - 1) * W + x - 1]) {
+          closedMask[row + x] = 1;
+        } else {
+          closedMask[row + x] = binMask[row + x];
+        }
+      }
     }
 
-    // Extract connected branch strokes
-    const visitedBranch = new Uint8Array(W * H);
-    const branches = [];
+    // Moore-Neighbor Boundary Tracing for 100% Watertight Closed Loops
+    const visitedBorder = new Uint8Array(W * H);
+    const closedLoops = [];
+    const drawnMask = new Uint8Array(W * H);
+
+    const dirX = [1, 1, 0, -1, -1, -1, 0, 1];
+    const dirY = [0, 1, 1, 1, 0, -1, -1, -1];
+
+    for (let y = 2; y < H - 2; y++) {
+      const row = y * W;
+      for (let x = 2; x < W - 2; x++) {
+        const idx = row + x;
+        if (closedMask[idx] === 1 && closedMask[idx - 1] === 0 && !visitedBorder[idx]) {
+          const rawPts = [{ x, y }];
+          visitedBorder[idx] = 1;
+          let cx = x, cy = y;
+          let dir = 7;
+          let maxSteps = 4500;
+          let isClosed = false;
+
+          while (maxSteps-- > 0) {
+            let nextDir = -1;
+            const searchStart = (dir + 5) % 8;
+            for (let i = 0; i < 8; i++) {
+              const d = (searchStart + i) % 8;
+              const nx = cx + dirX[d];
+              const ny = cy + dirY[d];
+              if (nx >= 0 && nx < W && ny >= 0 && ny < H && closedMask[ny * W + nx] === 1) {
+                nextDir = d;
+                cx = nx;
+                cy = ny;
+                break;
+              }
+            }
+
+            if (nextDir === -1) break;
+            if (cx === x && cy === y) {
+              isClosed = true;
+              break;
+            }
+
+            rawPts.push({ x: cx, y: cy });
+            visitedBorder[cy * W + cx] = 1;
+            dir = nextDir;
+          }
+
+          if (isClosed && rawPts.length >= 14) {
+            const simp = simplifyPoly(rawPts, 1.1);
+            if (simp.length >= 4) {
+              simp.push({ x: simp[0].x, y: simp[0].y }); // Strictly watertight closed cycle
+              closedLoops.push(simp);
+              for (let p of simp) {
+                const px = Math.round(p.x), py = Math.round(p.y);
+                if (px >= 0 && px < W && py >= 0 && py < H) drawnMask[py * W + px] = 1;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Extract remaining open strokes (Hair strands, subtle shading lines not enclosed in loops)
+    const openStrokes = [];
+    const visitedOpen = new Uint8Array(W * H);
 
     for (let y = 2; y < H - 2; y++) {
       const row = y * W;
       for (let x = 2; x < W - 2; x++) {
         const rootIdx = row + x;
-        if (cleanLines[rootIdx] && !visitedBranch[rootIdx]) {
-          const pts = [];
+        if (skel[rootIdx] === 1 && !drawnMask[rootIdx] && !visitedOpen[rootIdx]) {
+          const pts = [{ x, y }];
+          visitedOpen[rootIdx] = 1;
           let cx = x, cy = y;
-          visitedBranch[rootIdx] = 1;
-          pts.push({ x: cx, y: cy });
 
-          // Walk along branch
-          for (let step = 0; step < 600; step++) {
+          for (let step = 0; step < 500; step++) {
             let nextX = -1, nextY = -1;
             for (let dy = -1; dy <= 1; dy++) {
               const rOff = (cy + dy) * W;
               for (let dx = -1; dx <= 1; dx++) {
                 if (dx === 0 && dy === 0) continue;
-                const tx = cx + dx;
-                const ty = cy + dy;
+                const tx = cx + dx, ty = cy + dy;
                 const nIdx = rOff + tx;
-                if (tx >= 1 && tx < W - 1 && ty >= 1 && ty < H - 1 && cleanLines[nIdx] && !visitedBranch[nIdx]) {
-                  nextX = tx;
-                  nextY = ty;
+                if (tx >= 1 && tx < W - 1 && ty >= 1 && ty < H - 1 && skel[nIdx] === 1 && !drawnMask[nIdx] && !visitedOpen[nIdx]) {
+                  nextX = tx; nextY = ty;
                   break;
                 }
               }
               if (nextX !== -1) break;
             }
             if (nextX === -1) break;
-            cx = nextX;
-            cy = nextY;
-            visitedBranch[cy * W + cx] = 1;
+            cx = nextX; cy = nextY;
+            visitedOpen[cy * W + cx] = 1;
             pts.push({ x: cx, y: cy });
           }
 
-          if (pts.length >= 2) {
-            // Compute average saliency for this stroke
-            let salSum = 0;
-            for (let p of pts) salSum += saliency[p.y * W + p.x];
-            const avgSal = salSum / pts.length;
-
-            // Intelligent Saliency Budgeting:
-            // High saliency (faces/eyes): preserve 100% fine curvature, small L_max
-            // Low saliency (background/dust): decimate coarsely, prune tiny specks
-            if (avgSal < 0.25 && pts.length < 8) {
-              continue; // Prune background noise to save plotter budget
-            }
-
-            const decimateStep = avgSal >= 0.6 ? 1 : (avgSal >= 0.35 ? 2 : 3);
-            const maxSegLen = avgSal >= 0.6 ? 22.0 : (avgSal >= 0.35 ? 36.0 : 52.0);
-
-            const simplified = [pts[0]];
-            for (let i = decimateStep; i < pts.length - 1; i += decimateStep) {
-              simplified.push(pts[i]);
-            }
-            simplified.push(pts[pts.length - 1]);
-
-            let totalLen = 0;
-            for (let i = 1; i < simplified.length; i++) {
-              totalLen += Math.hypot(simplified[i].x - simplified[i - 1].x, simplified[i].y - simplified[i - 1].y);
-            }
-
-            if (totalLen > maxSegLen) {
-              const k = Math.max(1, Math.ceil(totalLen / maxSegLen));
-              const chunkSize = (simplified.length - 1) / k;
-              for (let i = 0; i < k; i++) {
-                const sIdx = Math.round(i * chunkSize);
-                let eIdx = Math.round((i + 1) * chunkSize) + 1;
-                eIdx = Math.min(eIdx, simplified.length);
-                const sub = simplified.slice(sIdx, eIdx);
-                if (sub.length >= 2) branches.push(sub);
-              }
-            } else {
-              branches.push(simplified);
-            }
+          if (pts.length >= 5) {
+            const simp = simplifyPoly(pts, 1.1);
+            if (simp.length >= 2) openStrokes.push(simp);
           }
         }
       }
     }
 
-    // 5. Two-Tier Physarum Slime Mold & Stealth A* Hybrid Highway Router
-    const costMap = new Float32Array(W * H);
-    for (let i = 0; i < W * H; i++) {
-      const invD = 1.0 - darkness[i];
-      costMap[i] = 1.0 + (invD * invD) * 3500.0;
-    }
-    for (let x = 0; x < W; x++) {
-      costMap[(H - 1) * W + x] = 0.05;
-      costMap[x] = 0.05;
-    }
-    for (let y = 0; y < H; y++) {
-      costMap[y * W] = 0.05;
-      costMap[y * W + (W - 1)] = 0.05;
-    }
-
-    // Build 1D Topological Graph with node-snapping (Tier 1 Physarum Fast-Path)
-    const topoNodes = [];
-    const topoAdj = [];
-    const drawnEdges = new Set();
-    const branchEdgeIds = [];
-    const edgeConductance = [];
-
-    function getOrCreateTopoNode(px, py) {
-      const snapDistSq = 3.2 * 3.2;
-      for (let i = 0; i < topoNodes.length; i++) {
-        const d = (topoNodes[i].x - px) ** 2 + (topoNodes[i].y - py) ** 2;
-        if (d <= snapDistSq) return i;
-      }
-      const idx = topoNodes.length;
-      topoNodes.push({ x: px, y: py });
-      topoAdj.push([]);
-      return idx;
-    }
-
-    for (let bIdx = 0; bIdx < branches.length; bIdx++) {
-      const b = branches[bIdx];
-      const u = getOrCreateTopoNode(b[0].x, b[0].y);
-      const v = getOrCreateTopoNode(b[b.length - 1].x, b[b.length - 1].y);
-      let len = 0;
-      for (let i = 1; i < b.length; i++) len += Math.hypot(b[i].x - b[i - 1].x, b[i].y - b[i - 1].y);
-      const eId = edgeConductance.length;
-      edgeConductance.push(1.0);
-      branchEdgeIds.push(eId);
-      topoAdj[u].push({ to: v, eId, len, pts: b });
-      topoAdj[v].push({ to: u, eId, len, pts: b.slice().reverse() });
-    }
+    const allElements = [];
+    for (let l of closedLoops) allElements.push({ type: 'loop', pts: l });
+    for (let s of openStrokes) allElements.push({ type: 'open', pts: s });
 
     // Tier 1: Early-Exit Physarum Dijkstra (< 0.1ms on graph nodes)
     function physarumGraphDijkstra(sx, sy, gx, gy) {
@@ -1589,36 +1596,44 @@
       curY = ty;
     }
 
-    // 6. Chain Branches by Nearest Endpoints
-    if (branches.length > 0) {
-      const unvisited = new Set(branches.keys());
-      let bestB = 0, bestY = -1;
+    // 6. Chain Closed Loops & Open Strokes (Watertight Gestalt Priority)
+    if (allElements.length > 0) {
+      const unvisited = new Set(allElements.keys());
+      let bestIdx = 0, bestY = -1;
       for (let i of unvisited) {
-        const b = branches[i];
-        const maxY = Math.max(b[0].y, b[b.length - 1].y);
-        if (maxY > bestY) {
-          bestY = maxY;
-          bestB = i;
+        const el = allElements[i];
+        for (let p of el.pts) {
+          if (p.y > bestY) {
+            bestY = p.y;
+            bestIdx = i;
+          }
         }
       }
 
-      let curBranch = branches[bestB];
-      unvisited.delete(bestB);
-      if (curBranch[0].y < curBranch[curBranch.length - 1].y) {
-        curBranch.reverse();
+      let curEl = allElements[bestIdx];
+      unvisited.delete(bestIdx);
+      if (curEl.pts[0].y < curEl.pts[curEl.pts.length - 1].y) {
+        curEl.pts.reverse();
       }
 
-      const orderedBranches = [curBranch];
+      const orderedElements = [curEl];
       while (unvisited.size > 0) {
-        const lastPt = orderedBranches[orderedBranches.length - 1][orderedBranches[orderedBranches.length - 1].length - 1];
+        const lastPt = orderedElements[orderedElements.length - 1].pts[orderedElements[orderedElements.length - 1].pts.length - 1];
         let bestDist = 1e9;
         let candIdx = -1;
         let shouldRev = false;
 
+        let sampleCount = 0;
         for (let idx of unvisited) {
-          const b = branches[idx];
-          const dH = Math.hypot(lastPt.x - b[0].x, lastPt.y - b[0].y);
-          const dT = Math.hypot(lastPt.x - b[b.length - 1].x, lastPt.y - b[b.length - 1].y);
+          if (sampleCount++ > 40) break;
+          const el = allElements[idx];
+          const pts = el.pts;
+          // Priority bonus for closed loops: ensures watertight boundaries are solidified first
+          const typeBonus = el.type === 'loop' ? 0.75 : 1.0;
+
+          const dH = Math.hypot(lastPt.x - pts[0].x, lastPt.y - pts[0].y) * typeBonus;
+          const dT = Math.hypot(lastPt.x - pts[pts.length - 1].x, lastPt.y - pts[pts.length - 1].y) * typeBonus;
+
           if (dH < bestDist) {
             bestDist = dH;
             candIdx = idx;
@@ -1632,20 +1647,23 @@
         }
 
         if (candIdx === -1) break;
-        const cand = branches[candIdx];
-        if (shouldRev) cand.reverse();
-        orderedBranches.push(cand);
+        const cand = allElements[candIdx];
+        if (shouldRev) cand.pts.reverse();
+        orderedElements.push(cand);
         unvisited.delete(candIdx);
       }
 
-      for (let b of orderedBranches) {
-        addStealthMove(b[0].x, b[0].y);
-        for (let pt of b) {
+      for (let el of orderedElements) {
+        addStealthMove(el.pts[0].x, el.pts[0].y);
+        for (let pt of el.pts) {
           path.push(pt);
-          costMap[pt.y * W + pt.x] = 0.005; // Scratched groove is free for future transit
+          const px = Math.round(pt.x), py = Math.round(pt.y);
+          if (px >= 0 && px < W && py >= 0 && py < H) {
+            costMap[py * W + px] = 0.005; // Scratched groove becomes free highway
+          }
         }
-        curX = b[b.length - 1].x;
-        curY = b[b.length - 1].y;
+        curX = el.pts[el.pts.length - 1].x;
+        curY = el.pts[el.pts.length - 1].y;
       }
     }
 
