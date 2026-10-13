@@ -369,10 +369,180 @@
     return humanizedPath;
   }
 
+  /**
+   * Generates a single continuous Eulerian TSP contour tour based on the Etchbot & Bosch TSP art algorithm.
+   * - Preserves aspect ratio with automatic letterbox/pillarbox centering.
+   * - Extracts dark edge/density stipple points.
+   * - Solves TSP using Nearest Neighbor + 2-Opt local search.
+   * - 100% continuous line (Pen Lifts: 0) connecting back to perimeter.
+   */
+  function generateEtchbotTSP(targetWidth, targetHeight, imageSource, opts) {
+    const imgW = imageSource.width;
+    const imgH = imageSource.height;
+    const imgData = imageSource.data;
+
+    const maxPoints = (opts && opts.maxPoints) || 900;
+    const threshold = (opts && opts.threshold !== undefined) ? opts.threshold : 0.42;
+    const optIterations = (opts && opts.optIterations !== undefined) ? opts.optIterations : 50;
+    const margin = (opts && opts.margin !== undefined) ? opts.margin : 24;
+    const humanize = (opts && opts.humanize !== undefined) ? opts.humanize : true;
+
+    // 1. Compute aspect ratio fit
+    const usableW = targetWidth - margin * 2;
+    const usableH = targetHeight - margin * 2;
+    const scale = Math.min(usableW / imgW, usableH / imgH);
+    const fitW = imgW * scale;
+    const fitH = imgH * scale;
+    const offX = (targetWidth - fitW) / 2;
+    const offY = (targetHeight - fitH) / 2;
+
+    // 2. Grayscale luminance buffer
+    const gray = new Float32Array(imgW * imgH);
+    for (let i = 0; i < imgW * imgH; i++) {
+      const idx = i * 4;
+      const r = imgData[idx];
+      const g = imgData[idx + 1];
+      const b = imgData[idx + 2];
+      gray[i] = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
+    }
+
+    // 3. Sobel Edge Gradient & Density Darkness Stippling
+    const candidatePoints = [];
+    const step = Math.max(2, Math.floor(Math.sqrt((imgW * imgH) / (maxPoints * 3.5))));
+
+    for (let y = 1; y < imgH - 1; y += step) {
+      for (let x = 1; x < imgW - 1; x += step) {
+        const gx = -gray[(y-1)*imgW + (x-1)] + gray[(y-1)*imgW + (x+1)]
+                   -2*gray[y*imgW + (x-1)] + 2*gray[y*imgW + (x+1)]
+                   -gray[(y+1)*imgW + (x-1)] + gray[(y+1)*imgW + (x+1)];
+        const gy = -gray[(y-1)*imgW + (x-1)] - 2*gray[(y-1)*imgW + x] - gray[(y-1)*imgW + (x+1)]
+                   +gray[(y+1)*imgW + (x-1)] + 2*gray[(y+1)*imgW + x] + gray[(y+1)*imgW + (x+1)];
+        const edge = Math.hypot(gx, gy);
+        const dark = 1.0 - gray[y * imgW + x];
+
+        const score = dark * 0.65 + edge * 0.85;
+        if (score > threshold) {
+          const px = offX + (x / imgW) * fitW;
+          const py = offY + (y / imgH) * fitH;
+          candidatePoints.push({ x: px, y: py, score });
+        }
+      }
+    }
+
+    if (candidatePoints.length === 0) {
+      return [{ x: 0, y: targetHeight - 1 }, { x: targetWidth - 1, y: targetHeight - 1 }];
+    }
+
+    // Subsample if too many candidate points
+    let points = candidatePoints;
+    if (candidatePoints.length > maxPoints) {
+      candidatePoints.sort((a, b) => b.score - a.score);
+      points = candidatePoints.slice(0, maxPoints);
+    }
+
+    // 4. Greedy Nearest Neighbor Tour
+    const N = points.length;
+    const visited = new Uint8Array(N);
+    const tour = [];
+    let curIdx = 0;
+    visited[0] = 1;
+    tour.push(points[0]);
+
+    for (let s = 1; s < N; s++) {
+      let bestDist = Infinity;
+      let bestIdx = -1;
+      const cur = points[curIdx];
+
+      for (let j = 0; j < N; j++) {
+        if (!visited[j]) {
+          const dx = cur.x - points[j].x;
+          const dy = cur.y - points[j].y;
+          const d = dx * dx + dy * dy;
+          if (d < bestDist) {
+            bestDist = d;
+            bestIdx = j;
+          }
+        }
+      }
+
+      if (bestIdx !== -1) {
+        visited[bestIdx] = 1;
+        curIdx = bestIdx;
+        tour.push(points[bestIdx]);
+      }
+    }
+
+    // 5. Fast 2-Opt Local Optimization (Untangle Line Crossings)
+    for (let iter = 0; iter < optIterations; iter++) {
+      let improved = false;
+      const len = tour.length;
+      const windowSize = Math.min(len - 1, 35);
+
+      for (let i = 1; i < len - 2; i++) {
+        const pA = tour[i - 1];
+        const pB = tour[i];
+
+        for (let j = i + 1; j < Math.min(len - 1, i + windowSize); j++) {
+          const pC = tour[j];
+          const pD = tour[j + 1];
+
+          const dCurrent = Math.hypot(pA.x - pB.x, pA.y - pB.y) + Math.hypot(pC.x - pD.x, pC.y - pD.y);
+          const dSwap    = Math.hypot(pA.x - pC.x, pA.y - pC.y) + Math.hypot(pB.x - pD.x, pB.y - pD.y);
+
+          if (dSwap < dCurrent - 0.5) {
+            let left = i, right = j;
+            while (left < right) {
+              const temp = tour[left];
+              tour[left] = tour[right];
+              tour[right] = temp;
+              left++;
+              right--;
+            }
+            improved = true;
+          }
+        }
+      }
+      if (!improved) break;
+    }
+
+    // 6. Connect to Home Base along Screen Bezel (0 Pen Lifts)
+    const resultPath = [];
+    resultPath.push({ x: 0, y: targetHeight - 1 });
+    resultPath.push({ x: tour[0].x, y: targetHeight - 1 });
+    for (let pt of tour) {
+      resultPath.push(pt);
+    }
+    const last = tour[tour.length - 1];
+    resultPath.push({ x: targetWidth - 1, y: last.y });
+    resultPath.push({ x: targetWidth - 1, y: targetHeight - 1 });
+    resultPath.push({ x: 0, y: targetHeight - 1 });
+
+    if (!humanize) return resultPath;
+
+    // 7. Humanized tremor
+    const finalPath = [];
+    for (let i = 0; i < resultPath.length; i++) {
+      const p = resultPath[i];
+      if (p.x === 0 || p.x === targetWidth - 1 || p.y === 0 || p.y === targetHeight - 1) {
+        finalPath.push(p);
+      } else {
+        const jx = smoothNoise1D(i * 0.22) * 0.4;
+        const jy = smoothNoise1D(i * 0.22 + 51.3) * 0.4;
+        finalPath.push({
+          x: Math.round((p.x + jx) * 10) / 10,
+          y: Math.round((p.y + jy) * 10) / 10
+        });
+      }
+    }
+
+    return finalPath;
+  }
+
   return {
     screentone,
     applyToImageData,
     generateEulerianHatch,
+    generateEtchbotTSP,
     BAYER_4X4,
     BAYER_8X8
   };
