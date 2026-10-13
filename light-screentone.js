@@ -1313,26 +1313,47 @@
               simplified.push(pts[i]);
             }
             simplified.push(pts[pts.length - 1]);
-            branches.push(simplified);
+
+            // [Optimal K-Partitioning] Split long branches into optimal sub-segments (L_max = 32px)
+            const maxSegLen = opt.maxSegmentLen || 32.0;
+            let totalLen = 0;
+            for (let i = 1; i < simplified.length; i++) {
+              totalLen += Math.hypot(simplified[i].x - simplified[i - 1].x, simplified[i].y - simplified[i - 1].y);
+            }
+            if (totalLen > maxSegLen) {
+              const k = Math.max(1, Math.ceil(totalLen / maxSegLen));
+              const chunkSize = (simplified.length - 1) / k;
+              for (let i = 0; i < k; i++) {
+                const sIdx = Math.round(i * chunkSize);
+                let eIdx = Math.round((i + 1) * chunkSize) + 1;
+                eIdx = Math.min(eIdx, simplified.length);
+                const sub = simplified.slice(sIdx, eIdx);
+                if (sub.length >= 2) branches.push(sub);
+              }
+            } else {
+              branches.push(simplified);
+            }
           }
         }
       }
     }
 
-    // 5. Stealth A* Cost Map
-    // Paper: 1500.0, Drawn strokes: 0.05, Perimeter Rails: 0.1
+    // 5. Dynamic Stealth Highway Router
+    // Untouched Paper: cost 3000.0 (Strictly avoided)
+    // Drawn Grooves (Highway): cost 0.005 (Virtually free permanent reuse)
+    // Perimeter Bezel Rails: cost 0.05
     const costMap = new Float32Array(W * H);
     for (let i = 0; i < W * H; i++) {
       const invD = 1.0 - darkness[i];
-      costMap[i] = 1.0 + (invD * invD) * 1500.0;
+      costMap[i] = 1.0 + (invD * invD) * 3000.0;
     }
     for (let x = 0; x < W; x++) {
-      costMap[(H - 1) * W + x] = 0.1;
-      costMap[x] = 0.1;
+      costMap[(H - 1) * W + x] = 0.05;
+      costMap[x] = 0.05;
     }
     for (let y = 0; y < H; y++) {
-      costMap[y * W] = 0.1;
-      costMap[y * W + (W - 1)] = 0.1;
+      costMap[y * W] = 0.05;
+      costMap[y * W + (W - 1)] = 0.05;
     }
 
     function findStealthPath(sx, sy, gx, gy) {
@@ -1427,7 +1448,7 @@
       for (let i = 1; i < transit.length; i++) {
         const pt = transit[i];
         path.push(pt);
-        costMap[pt.y * W + pt.x] = 0.05;
+        costMap[pt.y * W + pt.x] = 0.005; // Mark highway permanently free
       }
       curX = tx;
       curY = ty;
@@ -1486,7 +1507,7 @@
         addStealthMove(b[0].x, b[0].y);
         for (let pt of b) {
           path.push(pt);
-          costMap[pt.y * W + pt.x] = 0.05;
+          costMap[pt.y * W + pt.x] = 0.005; // Scratched groove is free for future transit
         }
         curX = b[b.length - 1].x;
         curY = b[b.length - 1].y;
