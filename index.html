@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LightScreentone // High-Speed Functional B&W Halftone Engine</title>
+  <style>
+    :root {
+      --bg: #141416;
+      --card: #1e1e24;
+      --border: #2d2d38;
+      --accent: #e53e3e;
+      --gold: #d69e2e;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+    }
+    header {
+      width: 100%;
+      max-width: 1100px;
+      margin-bottom: 24px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 16px;
+    }
+    h1 {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      color: #fff;
+    }
+    h1 span { color: var(--gold); }
+    .badge {
+      font-size: 11px;
+      padding: 4px 8px;
+      background: #272733;
+      border-radius: 4px;
+      color: #38bdf8;
+      font-family: monospace;
+    }
+    .container {
+      width: 100%;
+      max-width: 1100px;
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      gap: 24px;
+    }
+    .panel {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+    }
+    .panel-title {
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--muted);
+      margin-bottom: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .control-group {
+      margin-bottom: 18px;
+    }
+    label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      margin-bottom: 6px;
+      color: #cbd5e1;
+    }
+    .val-badge {
+      font-family: monospace;
+      color: var(--gold);
+    }
+    select, input[type="range"], input[type="file"] {
+      width: 100%;
+    }
+    select {
+      background: #121216;
+      border: 1px solid var(--border);
+      color: #fff;
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      outline: none;
+    }
+    input[type="range"] {
+      accent-color: var(--gold);
+    }
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    .btn-row {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    button {
+      flex: 1;
+      padding: 9px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: #2a2a38;
+      color: #fff;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    button:hover { background: #38384d; }
+    button.primary {
+      background: #b45309;
+      border-color: #d97706;
+    }
+    button.primary:hover { background: #d97706; }
+    .viewport {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .canvas-container {
+      background: #000;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 480px;
+      position: relative;
+      overflow: hidden;
+    }
+    canvas {
+      image-rendering: pixelated;
+      max-width: 100%;
+      height: auto;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+    }
+    .metric-card {
+      background: #17171d;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      text-align: center;
+    }
+    .metric-val {
+      font-size: 18px;
+      font-weight: 700;
+      font-family: monospace;
+      color: #38bdf8;
+    }
+    .metric-lbl {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>LIGHT-<span>SCREENTONE</span> // 흑백 이진 함수형 하프톤 엔진</h1>
+    <div class="badge">Zero Dependency · 1-Bit Halftone & Eulerian Vector</div>
+  </header>
+
+  <div class="container">
+    <!-- Controls Sidebar -->
+    <div class="panel">
+      <div class="panel-title">
+        <span>패턴 및 광학 파라미터</span>
+        <span class="val-badge" id="renderTime">0.0ms</span>
+      </div>
+
+      <div class="control-group">
+        <label>스크린톤 패턴 알고리즘</label>
+        <select id="selPattern">
+          <option value="dot">도트 하프톤 (Halftone Dot Matrix)</option>
+          <option value="line">라인 스크린톤 (Parallel Hatching)</option>
+          <option value="cross">크로스해칭 (Crosshatch Grid)</option>
+          <option value="bayer4">오더드 디더링 (Bayer 4x4)</option>
+          <option value="bayer8">오더드 디더링 (Bayer 8x8)</option>
+          <option value="stochastic">확률적 해시 노이즈 (Stochastic)</option>
+          <option value="concentric">동심원 스크린톤 (Concentric Rings)</option>
+        </select>
+      </div>
+
+      <div class="control-group">
+        <label>
+          <span>격자 주기 / 주파수 (Frequency)</span>
+          <span class="val-badge" id="lblFreq">8 px</span>
+        </label>
+        <input type="range" id="rngFreq" min="2" max="24" value="8" step="1">
+      </div>
+
+      <div class="control-group">
+        <label>
+          <span>스크린 회전각 (Screen Angle)</span>
+          <span class="val-badge" id="lblAngle">45 °</span>
+        </label>
+        <input type="range" id="rngAngle" min="0" max="180" value="45" step="1">
+      </div>
+
+      <div class="control-group">
+        <label class="toggle-row">
+          <input type="checkbox" id="chkInvert">
+          <span>명암 반전 (Invert Negative)</span>
+        </label>
+      </div>
+
+      <div class="control-group">
+        <label class="toggle-row">
+          <input type="checkbox" id="chkVector" checked>
+          <span>오일러 연속 벡터 경로 오버레이 (Pen Lifts: 0)</span>
+        </label>
+      </div>
+
+      <div class="panel-title" style="margin-top:24px;">샘플 입력 소스</div>
+
+      <div class="control-group">
+        <select id="selSource">
+          <option value="gradient">원형 방사 그라디언트 (Sphere Lighting)</option>
+          <option value="badapple">배드애플 실루엣 테스트 (Bad Apple Frame)</option>
+          <option value="stripes">사인파 그레이스케일 바 (Sine Grating)</option>
+        </select>
+      </div>
+
+      <div class="control-group">
+        <label>로컬 이미지 업로드</label>
+        <input type="file" id="fileUpload" accept="image/*">
+      </div>
+
+      <div class="btn-row">
+        <button id="btnRedraw" class="primary">실시간 다시 렌더링</button>
+        <button id="btnExportSVG">SVG 벡터 추출</button>
+      </div>
+    </div>
+
+    <!-- Viewport -->
+    <div class="viewport">
+      <div class="canvas-container">
+        <canvas id="mainCanvas" width="480" height="480"></canvas>
+      </div>
+
+      <div class="metrics">
+        <div class="metric-card">
+          <div class="metric-val" id="metVertices">0</div>
+          <div class="metric-lbl">오일러 연속선 정점</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-val" id="metPenLifts">0</div>
+          <div class="metric-lbl">펜 리프트 (Pen Lifts)</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-val" id="metDensity">0.0%</div>
+          <div class="metric-lbl">흑색 분말 면적률</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-val" id="metEngine">JS ES6</div>
+          <div class="metric-lbl">런타임 엔진</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="light-screentone.js"></script>
+  <script>
+    const canvas = document.getElementById('mainCanvas');
+    const ctx = canvas.getContext('2d');
+
+    const selPattern = document.getElementById('selPattern');
+    const rngFreq = document.getElementById('rngFreq');
+    const lblFreq = document.getElementById('lblFreq');
+    const rngAngle = document.getElementById('rngAngle');
+    const lblAngle = document.getElementById('lblAngle');
+    const chkInvert = document.getElementById('chkInvert');
+    const chkVector = document.getElementById('chkVector');
+    const selSource = document.getElementById('selSource');
+    const fileUpload = document.getElementById('fileUpload');
+    const btnRedraw = document.getElementById('btnRedraw');
+    const btnExportSVG = document.getElementById('btnExportSVG');
+
+    const renderTime = document.getElementById('renderTime');
+    const metVertices = document.getElementById('metVertices');
+    const metPenLifts = document.getElementById('metPenLifts');
+    const metDensity = document.getElementById('metDensity');
+
+    let customImg = null;
+
+    rngFreq.oninput = () => { lblFreq.textContent = `${rngFreq.value} px`; render(); };
+    rngAngle.oninput = () => { lblAngle.textContent = `${rngAngle.value} °`; render(); };
+    selPattern.onchange = render;
+    chkInvert.onchange = render;
+    chkVector.onchange = render;
+    selSource.onchange = () => { customImg = null; render(); };
+    btnRedraw.onclick = render;
+
+    fileUpload.onchange = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (evt) => {
+        const img = new Image();
+        img.onload = () => {
+          customImg = img;
+          render();
+        };
+        img.src = evt.target.result;
+      };
+      reader.readAsDataURL(file);
+    };
+
+    function drawSource(w, h) {
+      if (customImg) {
+        ctx.drawImage(customImg, 0, 0, w, h);
+        return;
+      }
+
+      const srcType = selSource.value;
+      if (srcType === 'gradient') {
+        // Radial 3D sphere gradient
+        const radGrad = ctx.createRadialGradient(w * 0.35, h * 0.35, 10, w * 0.5, h * 0.5, w * 0.45);
+        radGrad.addColorStop(0, '#ffffff');
+        radGrad.addColorStop(0.5, '#888888');
+        radGrad.addColorStop(1, '#000000');
+        ctx.fillStyle = radGrad;
+        ctx.fillRect(0, 0, w, h);
+      } else if (srcType === 'stripes') {
+        const imgData = ctx.createImageData(w, h);
+        const d = imgData.data;
+        for (let y = 0; y < h; y++) {
+          for (let x = 0; x < w; x++) {
+            const v = (Math.sin(x * 0.05) * 0.5 + 0.5) * (1.0 - y / h);
+            const c = Math.floor(v * 255);
+            const idx = (y * w + x) * 4;
+            d[idx] = c; d[idx+1] = c; d[idx+2] = c; d[idx+3] = 255;
+          }
+        }
+        ctx.putImageData(imgData, 0, 0);
+      } else {
+        // Bad apple silhouette with gradient shading
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = '#000000';
+
+        // Approximate apple / silhouette shape
+        ctx.beginPath();
+        ctx.arc(w * 0.5, h * 0.55, w * 0.3, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Leaf / stem
+        ctx.beginPath();
+        ctx.ellipse(w * 0.55, h * 0.22, w * 0.08, w * 0.04, -Math.PI / 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Shading gradient across apple
+        const linGrad = ctx.createLinearGradient(w * 0.2, h * 0.2, w * 0.8, h * 0.8);
+        linGrad.addColorStop(0, 'rgba(255,255,255,0.85)');
+        linGrad.addColorStop(0.5, 'rgba(128,128,128,0.2)');
+        linGrad.addColorStop(1, 'rgba(0,0,0,0.9)');
+        ctx.fillStyle = linGrad;
+        ctx.fillRect(0, 0, w, h);
+      }
+    }
+
+    let lastPath = [];
+
+    function render() {
+      const t0 = performance.now();
+      const w = canvas.width;
+      const h = canvas.height;
+
+      // 1. Draw source image
+      drawSource(w, h);
+
+      // 2. Extract ImageData
+      const imgData = ctx.getImageData(0, 0, w, h);
+
+      // 3. Apply screentone
+      const opts = {
+        pattern: selPattern.value,
+        frequency: parseInt(rngFreq.value, 10),
+        angle: parseFloat(rngAngle.value),
+        invert: chkInvert.checked
+      };
+
+      LightScreentone.applyToImageData(imgData, opts);
+      ctx.putImageData(imgData, 0, 0);
+
+      // 4. Calculate density
+      let blackPixels = 0;
+      const data = imgData.data;
+      for (let i = 0; i < data.length; i += 4) {
+        if (data[i] < 128) blackPixels++;
+      }
+      const density = (blackPixels / (w * h)) * 100.0;
+      metDensity.textContent = `${density.toFixed(1)}%`;
+
+      // 5. Generate Eulerian vector path if enabled
+      if (chkVector.checked) {
+        lastPath = LightScreentone.generateEulerianHatch(w, h, (px, py) => {
+          const ix = Math.min(Math.max(Math.floor(px), 0), w - 1);
+          const iy = Math.min(Math.max(Math.floor(py), 0), h - 1);
+          return data[(iy * w + ix) * 4] / 255.0;
+        }, { step: Math.max(parseInt(rngFreq.value, 10), 4), threshold: 0.5 });
+
+        // Draw red path overlay
+        ctx.strokeStyle = 'rgba(229, 62, 62, 0.75)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        for (let i = 0; i < lastPath.length; i++) {
+          if (i === 0) ctx.moveTo(lastPath[i].x, lastPath[i].y);
+          else ctx.lineTo(lastPath[i].x, lastPath[i].y);
+        }
+        ctx.stroke();
+
+        metVertices.textContent = lastPath.length.toLocaleString();
+        metPenLifts.textContent = '0 (100% Eulerian)';
+      } else {
+        lastPath = [];
+        metVertices.textContent = 'N/A';
+        metPenLifts.textContent = 'N/A';
+      }
+
+      const dt = performance.now() - t0;
+      renderTime.textContent = `${dt.toFixed(1)}ms`;
+    }
+
+    btnExportSVG.onclick = () => {
+      if (!lastPath || lastPath.length === 0) {
+        alert('먼저 오일러 연속 벡터 경로를 활성화해주세요.');
+        return;
+      }
+      let ptsStr = lastPath.map(p => `${p.x},${p.y}`).join(' ');
+      const svg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="${canvas.width}" height="${canvas.height}" viewBox="0 0 ${canvas.width} ${canvas.height}">
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <polyline fill="none" stroke="#000000" stroke-width="1.5" stroke-linejoin="round" points="${ptsStr}"/>
+</svg>`;
+      const blob = new Blob([svg], { type: 'image/svg+xml' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `screentone_eulerian_${selPattern.value}.svg`;
+      a.click();
+    };
+
+    window.onload = render;
+  </script>
+</body>
+</html>

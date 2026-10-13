@@ -1,0 +1,26 @@
+{
+  "name": "light-screentone",
+  "version": "1.0.0",
+  "description": "Ultra-lightweight functional black & white binary screentoning and Eulerian vector hatching engine",
+  "main": "light-screentone.js",
+  "types": "index.d.ts",
+  "scripts": {
+    "test": "node test/screentone.test.js"
+  },
+  "keywords": [
+    "screentone",
+    "halftone",
+    "dithering",
+    "bayer",
+    "binary",
+    "etch-a-sketch",
+    "plotter",
+    "eulerian-path"
+  ],
+  "author": "Minicom365 <3387910@naver.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/minicom365/light-screentone.git"
+  }
+}
