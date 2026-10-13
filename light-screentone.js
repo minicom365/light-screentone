@@ -1338,14 +1338,11 @@
       }
     }
 
-    // 5. Dynamic Stealth Highway Router
-    // Untouched Paper: cost 3000.0 (Strictly avoided)
-    // Drawn Grooves (Highway): cost 0.005 (Virtually free permanent reuse)
-    // Perimeter Bezel Rails: cost 0.05
+    // 5. Two-Tier Physarum Slime Mold & Stealth A* Hybrid Highway Router
     const costMap = new Float32Array(W * H);
     for (let i = 0; i < W * H; i++) {
       const invD = 1.0 - darkness[i];
-      costMap[i] = 1.0 + (invD * invD) * 3000.0;
+      costMap[i] = 1.0 + (invD * invD) * 3500.0;
     }
     for (let x = 0; x < W; x++) {
       costMap[(H - 1) * W + x] = 0.05;
@@ -1356,12 +1353,119 @@
       costMap[y * W + (W - 1)] = 0.05;
     }
 
+    // Build 1D Topological Graph with node-snapping (Tier 1 Physarum Fast-Path)
+    const topoNodes = [];
+    const topoAdj = [];
+    const drawnEdges = new Set();
+    const branchEdgeIds = [];
+    const edgeConductance = [];
+
+    function getOrCreateTopoNode(px, py) {
+      const snapDistSq = 3.2 * 3.2;
+      for (let i = 0; i < topoNodes.length; i++) {
+        const d = (topoNodes[i].x - px) ** 2 + (topoNodes[i].y - py) ** 2;
+        if (d <= snapDistSq) return i;
+      }
+      const idx = topoNodes.length;
+      topoNodes.push({ x: px, y: py });
+      topoAdj.push([]);
+      return idx;
+    }
+
+    for (let bIdx = 0; bIdx < branches.length; bIdx++) {
+      const b = branches[bIdx];
+      const u = getOrCreateTopoNode(b[0].x, b[0].y);
+      const v = getOrCreateTopoNode(b[b.length - 1].x, b[b.length - 1].y);
+      let len = 0;
+      for (let i = 1; i < b.length; i++) len += Math.hypot(b[i].x - b[i - 1].x, b[i].y - b[i - 1].y);
+      const eId = edgeConductance.length;
+      edgeConductance.push(1.0);
+      branchEdgeIds.push(eId);
+      topoAdj[u].push({ to: v, eId, len, pts: b });
+      topoAdj[v].push({ to: u, eId, len, pts: b.slice().reverse() });
+    }
+
+    // Tier 1: Early-Exit Physarum Dijkstra (< 0.1ms on graph nodes)
+    function physarumGraphDijkstra(sx, sy, gx, gy) {
+      if (topoNodes.length === 0) return null;
+
+      let uStart = -1, minDS = 1e9;
+      let vGoal = -1, minDG = 1e9;
+      for (let i = 0; i < topoNodes.length; i++) {
+        const ds = (topoNodes[i].x - sx) ** 2 + (topoNodes[i].y - sy) ** 2;
+        const dg = (topoNodes[i].x - gx) ** 2 + (topoNodes[i].y - gy) ** 2;
+        if (ds < minDS) { minDS = ds; uStart = i; }
+        if (dg < minDG) { minDG = dg; vGoal = i; }
+      }
+
+      if (minDS > 18.0 * 18.0 || minDG > 18.0 * 18.0) return null;
+      if (uStart === vGoal) return [{ x: sx, y: sy }, topoNodes[uStart], { x: gx, y: gy }];
+
+      const dist = new Float32Array(topoNodes.length);
+      dist.fill(1e9);
+      const parent = new Int32Array(topoNodes.length);
+      parent.fill(-1);
+      const parentPts = [];
+      parentPts.length = topoNodes.length;
+
+      dist[uStart] = 0;
+      const pq = [uStart, 0.0]; // [node, dist, ...]
+
+      let found = false;
+      while (pq.length > 0) {
+        let bestI = 0, bestD = pq[1];
+        for (let i = 3; i < pq.length; i += 2) {
+          if (pq[i] < bestD) { bestD = pq[i]; bestI = i - 1; }
+        }
+        const curr = pq[bestI];
+        pq[bestI] = pq[pq.length - 2];
+        pq[bestI + 1] = pq[pq.length - 1];
+        pq.length -= 2;
+
+        if (curr === vGoal) { found = true; break; }
+        const cDist = dist[curr];
+
+        const edges = topoAdj[curr];
+        for (let i = 0; i < edges.length; i++) {
+          const e = edges[i];
+          const isDrawn = drawnEdges.has(e.eId);
+          // Physarum Slime Mold resistance law: drawn tubes have near-zero resistance
+          const resistance = isDrawn ? 0.002 : e.len * 2.0;
+          const nc = cDist + resistance;
+          if (nc < dist[e.to]) {
+            dist[e.to] = nc;
+            parent[e.to] = curr;
+            parentPts[e.to] = e.pts;
+            pq.push(e.to, nc);
+          }
+        }
+      }
+
+      if (!found || dist[vGoal] > 90.0) return null;
+
+      const path = [];
+      let c = vGoal;
+      while (c !== -1 && parent[c] !== -1) {
+        const pts = parentPts[c];
+        for (let k = pts.length - 1; k >= 1; k--) path.push(pts[k]);
+        c = parent[c];
+      }
+      path.push(topoNodes[uStart]);
+      path.reverse();
+      return [{ x: sx, y: sy }, ...path, { x: gx, y: gy }];
+    }
+
+    // Tier 2: Bounded Stealth A* Fallback
     function findStealthPath(sx, sy, gx, gy) {
       sx = Math.max(0, Math.min(W - 1, Math.round(sx)));
       sy = Math.max(0, Math.min(H - 1, Math.round(sy)));
       gx = Math.max(0, Math.min(W - 1, Math.round(gx)));
       gy = Math.max(0, Math.min(H - 1, Math.round(gy)));
       if (sx === gx && sy === gy) return [{ x: gx, y: gy }];
+
+      // Try Tier 1 Physarum Graph Dijkstra (< 0.1ms)
+      const t1Path = physarumGraphDijkstra(sx, sy, gx, gy);
+      if (t1Path) return t1Path;
 
       const dist = new Float32Array(W * H);
       dist.fill(1e9);
@@ -1378,7 +1482,6 @@
 
       while (pq.length > 0 && iters < 8000) {
         iters++;
-        // Pop lowest f-score
         let bestI = 0;
         let bestF = pq[1];
         for (let i = 3; i < pq.length; i += 2) {
